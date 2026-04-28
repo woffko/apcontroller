@@ -8,9 +8,66 @@
 'require ui';
 'require view';
 
-let callHostHints, callAPControllerActivity, callAPControllerScripts, callAPController;
+let callHostHints, callAPControllerActivity, callAPControllerScripts, callAPController, callAPControllerSSHSetup;
 const additionalScriptFile = '/usr/share/apcontroller/apcontroller.user';
 let additionalScript = '';
+let pendingSSHSetupSections = [];
+
+function defaultKeyfile(section_id) {
+	return '/root/.ssh/id_apc_' + section_id;
+}
+
+function addUnique(list, value) {
+	if (value && !list.includes(value))
+		list.push(value);
+}
+
+function flagEnabled(value) {
+	return value === '1' || value === true || value === 1;
+}
+
+function optionInput(section_id, option) {
+	return document.getElementById('cbid.apcontroller.' + section_id + '.' + option);
+}
+
+function syncAutomaticSSHSetupUI(section_id) {
+	const autoInput = optionInput(section_id, 'autokeysetup');
+	if (!autoInput)
+		return;
+
+	const autoEnabled = autoInput.checked;
+	const useKeyInput = optionInput(section_id, 'usekeyfile');
+	const keyfileInput = optionInput(section_id, 'keyfile');
+
+	if (useKeyInput) {
+		useKeyInput.disabled = autoEnabled;
+		if (autoEnabled) {
+			if (useKeyInput.dataset.manualChecked == null)
+				useKeyInput.dataset.manualChecked = useKeyInput.checked ? '1' : '0';
+			useKeyInput.checked = true;
+		} else if (useKeyInput.dataset.manualChecked != null) {
+			useKeyInput.checked = useKeyInput.dataset.manualChecked === '1';
+			delete useKeyInput.dataset.manualChecked;
+		}
+		if (useKeyInput.parentElement) {
+			useKeyInput.parentElement.title = autoEnabled ? _('Enabled by Automatic SSH Key Setup') : '';
+			useKeyInput.parentElement.style.opacity = autoEnabled ? '0.6' : '';
+		}
+	}
+
+	if (keyfileInput) {
+		keyfileInput.readOnly = autoEnabled;
+		keyfileInput.title = autoEnabled ? _('Managed by Automatic SSH Key Setup') : '';
+		if (autoEnabled) {
+			if (keyfileInput.dataset.manualValue == null)
+				keyfileInput.dataset.manualValue = keyfileInput.value || '';
+			keyfileInput.value = defaultKeyfile(section_id);
+		} else if (keyfileInput.dataset.manualValue != null) {
+			keyfileInput.value = keyfileInput.dataset.manualValue;
+			delete keyfileInput.dataset.manualValue;
+		}
+	}
+}
 
 callHostHints = rpc.declare({
 	object: 'luci-rpc',
@@ -37,6 +94,13 @@ callAPController = rpc.declare({
 	expect: { '': {} }
 });
 
+callAPControllerSSHSetup = rpc.declare({
+	object: 'apcontroller',
+	method: 'ssh_setup',
+	params: [ 'section', 'ipaddr', 'username', 'password', 'port', 'keyfile' ],
+	expect: { '': {} }
+});
+
 function nextFreeSid(name, offset) {
 	let sid = '' + name + offset;
 
@@ -51,31 +115,67 @@ function lz(n) {
 }
 
 function hostStatus(records, section_id) {
-	let lastContact = -1;
-	let lastContact_ts = -1;
-	const obj = records.find(item => item.section === section_id);
-	if (obj) {
-		lastContact = obj['.lastcontact'];
-		lastContact_ts = obj['lastcontact_ts'];
-	}
+	const obj = records.find(item => item && item.section === section_id);
+	if (!obj) return statusBadge(_('Unknown'), '#fafafa', '#757575');
 
-	if (lastContact == -1)
-		return E('span', '-');
-	else {
-		const timestamp = new Date().getTime() / 1000;
-		const interval = uci.get('apcontroller', '@global[0]', 'interval');
-		if (!interval)
-			return E('span', { 'style': 'color: gray' }, _('Unknown'));
-		else
-			if (timestamp - lastContact_ts > parseInt(interval) * 2.5 * 60)
-				return E('span', { 'style': 'color: red' }, '● ' + _('Offline'));
-			else
-				return E('span', { 'style': 'color: green' }, '● ' + _('Online'));
+	switch (obj.status) {
+	case 'online':
+		return statusBadge(_('Online'), '#e8f5e9', '#2e7d32', _('Last SSH poll succeeded within the configured interval'));
+	case 'ssh_failed':
+		return statusBadge(_('Ping OK / SSH failed'), '#fff8e1', '#8a5a00', _('The device replies to ping, but the latest SSH poll is stale or failed'));
+	case 'offline':
+		return statusBadge(_('Offline'), '#ffebee', '#b71c1c', _('The latest SSH poll is stale or failed, and ping did not reply'));
+	case 'disabled':
+		return statusBadge(_('Disabled'), '#eeeeee', '#616161');
+	default:
+		return statusBadge(_('Unknown'), '#fafafa', '#757575');
 	}
 }
 
+function statusBadge(label, background, color, title) {
+	return E('span', {
+		'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:%s;color:%s;font-size:11px;font-weight:600;'.format(background, color),
+		'title': title || label
+	}, label);
+}
+
+function hostIsOnline(host) {
+	if (!host)
+		return false;
+	if (host.status)
+		return host.status === 'online';
+	return host['.lastcontact'] >= 0;
+}
+
+function countHostStatus(host) {
+	if (!host)
+		return 'unknown';
+	if (host.status === 'online' || host.status === 'offline')
+		return host.status;
+	return 'unknown';
+}
+
+function hostAuthMode(records, section_id) {
+	const obj = records.find(item => item && item.section === section_id);
+	if (!obj) return E('span', '-');
+
+	if (obj.authmode === 'auto_key')
+		return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#e8f5e9;color:#1b5e20;font-size:11px;font-weight:600;' }, _('Automatic SSH key'));
+
+	if (obj.authmode === 'auto_key_missing')
+		return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('Automatic SSH key missing'));
+
+	if (obj.authmode === 'key')
+		return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#e8f5e9;color:#1b5e20;font-size:11px;font-weight:600;' }, _('SSH key'));
+
+	if (obj.authmode === 'key_missing')
+		return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('SSH key missing'));
+
+	return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('SSH password'));
+}
+
 function hostInfo(key, records, section_id) {
-	const obj = records.find(item => item.section === section_id);
+	const obj = records.find(item => item && item.section === section_id);
 	const data = obj ? (obj[key] ? obj[key] : '-') : '-';
 	return E('span', data);
 }
@@ -90,7 +190,67 @@ return view.extend({
 		]);
 	},
 
+	runSSHSetups: function(setupSections, reloadAfter) {
+		const map = this.map;
+		let setupPromises = [];
+		setupSections = setupSections || [];
+
+		pendingSSHSetupSections.forEach(section_id => {
+			addUnique(setupSections, section_id);
+		});
+		pendingSSHSetupSections = [];
+
+		setupSections.forEach(section_id => {
+			let ipaddr = map.data.get('apcontroller', section_id, 'ipaddr');
+			let username = map.data.get('apcontroller', section_id, 'username') || 'root';
+			let password = map.data.get('apcontroller', section_id, 'password');
+			let port = map.data.get('apcontroller', section_id, 'port') || '22';
+			let keyfile = defaultKeyfile(section_id);
+
+			if (password && ipaddr) {
+				setupPromises.push({
+					id: section_id,
+					name: map.data.get('apcontroller', section_id, 'name') || section_id,
+					fn: () => callAPControllerSSHSetup(section_id, ipaddr, username, password, port, keyfile)
+				});
+			} else {
+				ui.addNotification(null, E('p', _('SSH setup for %s skipped: missing host address or password').format(map.data.get('apcontroller', section_id, 'name') || section_id)), 'warning');
+			}
+		});
+
+		if (setupPromises.length === 0)
+			return Promise.resolve();
+
+		ui.showModal(_('Automatic SSH Key Setup'), [
+			E('p', { 'class': 'spinning' }, [ _('Pairing with %d devices... (SSH password used once)').format(setupPromises.length) ])
+		]);
+
+		return Promise.all(setupPromises.map(p => {
+			return p.fn().then(res => {
+				if (res.result === 'success') {
+					ui.addNotification(null, E('p', _('SSH setup for %s success!').format(p.name)), 'info');
+				} else {
+					ui.addNotification(null, E('p', _('SSH setup for %s failed: %s').format(p.name, res.error || 'Unknown error')), 'error');
+				}
+			});
+		})).then(() => {
+			ui.hideModal();
+			return uci.unload('apcontroller').then(() => uci.load('apcontroller'));
+		}).then(() => {
+			if (reloadAfter)
+				setTimeout(() => window.location.reload(), 1500);
+		});
+	},
+
+	handleSave: function(ev) {
+		pendingSSHSetupSections = [];
+
+		return this.super('handleSave', [ev]).then(() => this.runSSHSetups([], false));
+	},
+
 	handleSaveApply: function(ev, mode) {
+		pendingSSHSetupSections = [];
+
 		let value = ((document.querySelector('#apcontrolleradditionalscript').value || '').trim().replace(/\r\n/g, '\n')) + '\n';
 		fs.write(additionalScriptFile, value)
 			.then(function () {
@@ -100,50 +260,54 @@ return view.extend({
 			}).catch(function (e) {
 				document.body.scrollTop = document.documentElement.scrollTop = 0;
 				ui.addNotification(null, E('p', (_('Unable to save additional script') + ': %s').format(e.message)), 'error');
-			});
+		});
 
 		return this.super('handleSaveApply', [ev, mode]).then(() => {
+			let runSetup = this.runSSHSetups([], true);
+
 			const container = document.querySelector('.cbi-value[data-name="interval"]');
-			if (!container) return;
-			const input = container.querySelector('input');
-			if (!input) return;
+			const intervalInput = container ? container.querySelector('input') : null;
+			const interval = intervalInput ? intervalInput.value : null;
 
-			const interval = input.value;
+			let cronTask = Promise.resolve();
+			if (interval) {
+				cronTask = fs.read('/etc/crontabs/root').then((data) => {
+					let crontabsroot = data || '';
+					const regLine = /^(\*\/\d+ \* \* \* \* \/usr\/bin\/apcontroller)$/m;
+					const wanted = `*/${interval} * * * * /usr/bin/apcontroller`;
 
-			return fs.read('/etc/crontabs/root').then((data) => {
-				let crontabsroot = data || '';
-				const regLine = /^(\*\/\d+ \* \* \* \* \/usr\/bin\/apcontroller)$/m;
-				const wanted = `*/${interval} * * * * /usr/bin/apcontroller`;
+					let needUpdate = false;
+					if (!regLine.test(crontabsroot)) {
+						if (!crontabsroot.endsWith('\n')) crontabsroot += '\n';
+						crontabsroot += wanted + '\n';
+						needUpdate = true;
+					} else if (!crontabsroot.includes(wanted)) {
+						crontabsroot = crontabsroot.replace(regLine, wanted);
+						needUpdate = true;
+					}
 
-				let needUpdate = false;
-				if (!regLine.test(crontabsroot)) {
-					if (!crontabsroot.endsWith('\n'))
-						crontabsroot += '\n';
-					crontabsroot += wanted + '\n';
-					needUpdate = true;
-				} else if (!crontabsroot.includes(wanted)) {
-					crontabsroot = crontabsroot.replace(regLine, wanted);
-					needUpdate = true;
-				}
+					if (needUpdate) {
+						return fs.write('/etc/crontabs/root', crontabsroot).then(() => fs.exec('/etc/init.d/cron', ['reload']));
+					}
+				});
+			}
 
-				if (!needUpdate) return;
-
-				return fs.write('/etc/crontabs/root', crontabsroot)
-					.then(() => fs.exec('/etc/init.d/cron', ['reload']))
-					.then(() => fs.exec('/usr/bin/apcontroller'));
+			return Promise.all([runSetup, cronTask]).then(() => {
+				return;
 			});
 		});
 	},
 
-	render: function(data) {
-		const hosts = data[0];
-		let devicestatus = {};
-		let clients = [];
+		render: function(data) {
+			const hosts = data[0];
+			let devicestatus = {};
+			let clients = [];
 		updateDeviceStatus(data[1]);
 		additionalScript = data[2];
 
 		const devicesmorecolumns = {
 			'status': _('Status'),
+			'authmode': _('Auth Mode'),
 			'lastcontact': _('Last Contact'),
 			'mac': _('MAC Address'),
 			'hostname': _('Hostname'),
@@ -340,9 +504,13 @@ return view.extend({
 			document.querySelectorAll('#cbi-apcontroller-host tr[data-section-id]').forEach(row => {
 				const section_id = row.dataset.sectionId;
 				const hostRecord = devicestatus.hosts.find(h => h.section === section_id);
+				const state = countHostStatus(hostRecord);
+
+				if (state === 'online') devicesonline++;
+				if (state === 'offline') devicesoffline++;
 
 				row.querySelectorAll('li[data-state="disabled"]').forEach(e => {
-					if (typeof hostRecord === 'undefined' || !hostRecord || hostRecord['.lastcontact'] == -1) {
+					if (!hostIsOnline(hostRecord)) {
 						e.setAttribute('aria-disabled', 'true');
 						e.classList.add('disabled');
 						e.style.pointerEvents = 'none';
@@ -355,21 +523,22 @@ return view.extend({
 					}
 				})
 
-				Object.entries(devicesmorecolumns).forEach(([key, value]) => {
-					if (selectedcolumns.includes(key) || key == 'status') {
-						const cell = row.querySelector('[data-name="_' + key + '"]');
-						if (!cell) return;
+					Object.entries(devicesmorecolumns).forEach(([key, value]) => {
+						if (selectedcolumns.includes(key)) {
+							const cell = row.querySelector('[data-name="_' + key + '"]');
+							if (!cell) return;
 
-						cell.innerHTML = '';
-						if (key == 'status') {
-							let status = hostStatus([hostRecord], section_id)
-							if (status.textContent.includes(_('Online'))) devicesonline++;
-							if (status.textContent.includes(_('Offline'))) devicesoffline++;
-							cell.appendChild(status);
-						} else
-							cell.appendChild(hostInfo(key, [hostRecord], section_id));
-					}
-				});
+							cell.innerHTML = '';
+							if (key == 'status') {
+								let status = hostStatus([hostRecord], section_id)
+								cell.appendChild(status);
+							} else if (key == 'authmode') {
+								cell.appendChild(hostAuthMode([hostRecord], section_id));
+							} else {
+								cell.appendChild(hostInfo(key, [hostRecord], section_id));
+							}
+						}
+					});
 				devicesall ++;
 			});
 			let e = document.querySelector('#devicesall');
@@ -384,9 +553,10 @@ return view.extend({
 
 		const selectedcolumns = uci.get('apcontroller', '@global[0]', 'column') || [];
 
-		let m, s, o;
-		m = new form.Map('apcontroller', _('AP Controller'), _('Router and AP Management'));
-		m.tabbed = true;
+			let m, s, o;
+			m = new form.Map('apcontroller', _('AP Controller'), _('Router and AP Management'));
+			this.map = m;
+			m.tabbed = true;
 
 
 		// Devices tab
@@ -407,11 +577,11 @@ return view.extend({
 				let devicesonline = 0;
 				let devicesoffline = 0;
 				nodes.querySelectorAll('#cbi-apcontroller-host tr[data-section-id]').forEach(row => {
-					const cell = row.querySelector('td[data-name="_status"]');
-					if (cell) {
-						if (cell.textContent.includes(_('Online'))) devicesonline ++;
-						if (cell.textContent.includes(_('Offline'))) devicesoffline ++;
-					}
+					const section_id = row.dataset.sectionId;
+					const hostRecord = devicestatus.hosts.find(h => h.section === section_id);
+					const state = countHostStatus(hostRecord);
+					if (state === 'online') devicesonline++;
+					if (state === 'offline') devicesoffline++;
 					devicesall ++;
 				});
 
@@ -476,7 +646,7 @@ return view.extend({
 			actionBtn.querySelector('li[data-value="activity"]').setAttribute('data-state', 'disabled');
 			actionBtn.querySelector('li[data-value="exec"]').setAttribute('data-state', 'disabled');
 
-			if (typeof host === 'undefined' || host['.lastcontact'] == -1) {
+			if (!hostIsOnline(host)) {
 				actionBtn.querySelectorAll('li[data-state="disabled"]').forEach(e => {
 					e.setAttribute('aria-disabled', 'true');
 					e.classList.add('disabled');
@@ -523,8 +693,8 @@ return view.extend({
 			return tdEl;
 		};
 
-		s.handleAdd = function(ev) {
-			ev?.preventDefault();
+			s.handleAdd = function(ev) {
+				ev?.preventDefault();
 
 			const newSid = nextFreeSid('host', uci.sections('apcontroller', 'host').length);
 			this.map.data.add('apcontroller', 'host', newSid);
@@ -552,8 +722,8 @@ return view.extend({
 						}
 					}, 50);
 				}
-			});
-		};
+				});
+			};
 
 		s.actionMoreInformation = function(section_id) {
 			const host = devicestatus.hosts.find(item => item.section === section_id);
@@ -741,10 +911,12 @@ return view.extend({
 									}
 									let cmd = '';
 									let args = [];
-									if (row['usekeyfile'] && row['keyfile']) {
+									const actionKeyfile = flagEnabled(row['autokeysetup']) ? defaultKeyfile(section_id) : row['keyfile'];
+									const actionUseKey = flagEnabled(row['autokeysetup']) || (row['usekeyfile'] && actionKeyfile);
+									if (actionUseKey && actionKeyfile) {
 											cmd = 'scp';
 											args = [
-												'-i', row['keyfile'],
+												'-i', actionKeyfile,
 												'-o', 'StrictHostKeyChecking=no',
 												'-P', row['port'],
 												'/usr/share/apcontroller/scripts/' + script,
@@ -762,11 +934,11 @@ return view.extend({
 											];
 									}
 									return fs.exec(cmd, args).then(function(res) {
-										if (row['usekeyfile'] && row['keyfile']) {
+										if (actionUseKey && actionKeyfile) {
 											cmd = 'ssh';
 											args = [
 												'-q',
-												'-i', row['keyfile'],
+												'-i', actionKeyfile,
 												'-o', 'StrictHostKeyChecking=no',
 												'-p', row['port'],
 												row['username'] + '@' + row['ipaddr'],
@@ -882,24 +1054,122 @@ return view.extend({
 		o.rmempty = false;
 		o.default = 'root';
 
-		o = s.taboption('host', form.Flag, 'usekeyfile', _('Use SSH key'), _('Use SSH key instead of password'));
-		o.modalonly = true;
-		o.rmempty = false;
-		o.default = 0;
-
-		o = s.taboption('host', form.Value, 'keyfile', _('SSH Key file'), _('SSH Key file'));
-		o.modalonly = true;
-		o.rmempty = false;
-		o.default = '/root/.ssh/id_dropbear';
-		o.depends('usekeyfile', '1');
-
 		o = s.taboption('host', form.Value, 'password', _('Password'), _('Device Password'));
 		o.modalonly = true;
 		o.password = true;
-		o.depends('usekeyfile', '0');
+		o.retain = true;
+		o.renderWidget = function(section_id) {
+			const widget = form.Value.prototype.renderWidget.apply(this, arguments);
+			const input = widget && widget.querySelector ? widget.querySelector('input') : null;
+			if (input) {
+				input.setAttribute('autocomplete', 'new-password');
+				input.setAttribute('autocorrect', 'off');
+				input.setAttribute('autocapitalize', 'off');
+				input.setAttribute('spellcheck', 'false');
+				input.setAttribute('data-lpignore', 'true');
+			}
+			return widget;
+		};
+
+		o = s.taboption('host', form.Flag, 'autokeysetup', _('Automatic SSH Key Setup'), _('Requires the correct SSH password when setup is enabled. On save, the password is used once to install a generated per-device key, then future connections use that key.'));
+		o.modalonly = true;
+		o.rmempty = false;
+		o.default = 0;
+		o.write = function(section_id, value) {
+			const oldValue = this.cfgvalue(section_id);
+			const ret = form.Flag.prototype.write.apply(this, arguments);
+			if (flagEnabled(value) && !flagEnabled(oldValue))
+				addUnique(pendingSSHSetupSections, section_id);
+			return ret;
+		};
+		o.renderWidget = function(section_id) {
+			const widget = form.Flag.prototype.renderWidget.apply(this, arguments);
+			const input = widget && widget.querySelector ? widget.querySelector('input') : null;
+			const password = (this.map.data.get('apcontroller', section_id, 'password') || '').trim();
+			if (input && !password) {
+				input.parentElement.title = _('Enter the SSH password before saving to run setup');
+			}
+			if (input) {
+				input.addEventListener('change', () => {
+					setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+				});
+				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+			}
+			return widget;
+		};
+
+			o = s.taboption('host', form.Flag, 'usekeyfile', _('Use SSH key'), _('Use a manually supplied SSH private key when automatic setup is disabled.'));
+			o.modalonly = true;
+			o.rmempty = false;
+			o.default = 0;
+			o.cfgvalue = function(section_id) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return '1';
+				return form.Flag.prototype.cfgvalue.apply(this, arguments);
+			};
+			o.write = function(section_id, value) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return;
+				return form.Flag.prototype.write.apply(this, arguments);
+			};
+			o.remove = function(section_id) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return;
+				return form.Flag.prototype.remove.apply(this, arguments);
+			};
+			o.renderWidget = function(section_id) {
+				const widget = form.Flag.prototype.renderWidget.apply(this, arguments);
+				const input = widget && widget.querySelector ? widget.querySelector('input') : null;
+				if (input && flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup'))) {
+					input.checked = true;
+					input.disabled = true;
+					input.parentElement.title = _('Enabled by Automatic SSH Key Setup');
+					input.parentElement.style.opacity = '0.6';
+				}
+				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+				return widget;
+			};
+
+			o = s.taboption('host', form.Value, 'keyfile', _('SSH Key file'), _('Path to the private SSH key file.'));
+			o.modalonly = true;
+			o.rmempty = true;
+			o.optional = true;
+			o.placeholder = function(section_id) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return defaultKeyfile(section_id);
+				return '/root/.ssh/id_custom';
+			};
+			o.cfgvalue = function(section_id) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return defaultKeyfile(section_id);
+				return this.map.data.get('apcontroller', section_id, 'keyfile');
+			};
+			o.write = function(section_id, value) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return;
+				return form.Value.prototype.write.apply(this, arguments);
+			};
+			o.remove = function(section_id) {
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+					return;
+				return form.Value.prototype.remove.apply(this, arguments);
+			};
+			o.renderWidget = function(section_id) {
+				const widget = form.Value.prototype.renderWidget.apply(this, arguments);
+				const input = widget && widget.querySelector ? widget.querySelector('input') : null;
+				if (input && flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup'))) {
+					input.value = defaultKeyfile(section_id);
+					input.readOnly = true;
+					input.title = _('Managed by Automatic SSH Key Setup');
+				}
+				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+				return widget;
+			};
+		o.depends('autokeysetup', '1');
+		o.depends('usekeyfile', '1');
 
 		Object.entries(devicesmorecolumns).forEach(([key, value]) => {
-			if (selectedcolumns.includes(key) || key == 'status') {
+			if (selectedcolumns.includes(key)) {
 				o = s.taboption('host', form.DummyValue, '_' + key, value);
 				o.rawhtml = true;
 				o.write = function() {};
@@ -907,6 +1177,8 @@ return view.extend({
 				o.modalonly = false;
 				if (key == 'status')
 					o.textvalue = hostStatus.bind(o, devicestatus.hosts);
+				else if (key == 'authmode')
+					o.textvalue = hostAuthMode.bind(o, devicestatus.hosts);
 				else
 					o.textvalue = hostInfo.bind(o, key, devicestatus.hosts);
 			}
@@ -1209,8 +1481,7 @@ return view.extend({
 		o.value('name', _('Name'));
 		o.value('ipaddr', _('Host Address'));
 		Object.entries(devicesmorecolumns).forEach(([key, value]) => {
-			if (key != 'status')
-				o.value(key, value);
+			o.value(key, value);
 		});
 
 		o = s.option(form.MultiValue, 'clientcolumn', _('Clients List Columns'), _('List of columns to display in the clients list'));
@@ -1274,17 +1545,17 @@ return view.extend({
 		var refreshBtn = E('button', {
 			'class': 'cbi-button',
 			'click': ui.createHandlerFn(this, async function() {
-				return fs.exec('/usr/bin/apcontroller')
-					.then(
-						ui.showModal(_('Refresh'), [
-							E('p', { 'class': 'spinning' }, [ _('Please wait...') ])
-						])
-					).then(
-						setTimeout(() => {
-							ui.hideModal();
-							window.location.reload();
-						}, 2000)
-					)
+				ui.showModal(_('Refresh'), [
+					E('p', { 'class': 'spinning' }, [ _('Please wait...') ])
+				]);
+
+				try {
+					await fs.exec('/usr/bin/apcontroller');
+					window.location.reload();
+				} catch (e) {
+					ui.hideModal();
+					ui.addNotification(null, E('p', _('Refresh failed: %s').format(e.message || e)), 'error');
+				}
 			})
 		}, [ _('Refresh') ]);
 

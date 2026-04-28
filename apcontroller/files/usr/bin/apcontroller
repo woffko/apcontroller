@@ -8,41 +8,148 @@ BASEPATH="/tmp/apcontroller"
 
 . /lib/functions.sh
 
+log_apcontroller() {
+	logger -t apcontroller "$1"
+}
+
+default_keyfile() {
+	echo "/root/.ssh/id_apc_$1"
+}
+
+normalize_keyfile() {
+	local section="$1"
+	local keyfile="$2"
+	local default
+
+	default="$(default_keyfile "$section")"
+
+	case "$keyfile" in
+		""|"/root/.ssh/id_dropbear")
+			echo "$default"
+			;;
+		/root/.ssh/id_apc_*)
+			[ "$keyfile" = "$default" ] && echo "$keyfile" || echo "$default"
+			;;
+		*)
+			echo "$keyfile"
+			;;
+	esac
+}
+
+setup_missing_key() {
+	local cfg="$1"
+	local ipaddr="$2"
+	local keyfile="$3"
+	local errfile="$4"
+	local password="$5"
+
+	if [ -z "$password" ]; then
+		log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' missing and no password is stored for key setup. Aborting."
+		return 1
+	fi
+
+	if [ ! -x /usr/libexec/rpcd/apcontroller ]; then
+		log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' missing and ssh_setup helper is unavailable. Aborting."
+		return 1
+	fi
+
+	log_apcontroller "Host '$cfg' (${ipaddr}) key file '${keyfile}' missing; running SSH key setup."
+	printf '{"section":"%s"}\n' "$cfg" | /usr/libexec/rpcd/apcontroller call ssh_setup >"$errfile" 2>&1
+
+	if [ -e "$keyfile" ]; then
+		log_apcontroller "Host '$cfg' (${ipaddr}) key setup created '${keyfile}'."
+		return 0
+	fi
+
+	log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' missing after setup: $(tr '\n' ' ' < "$errfile")"
+	return 1
+}
+
 get_data_from_host() {
 	local cfg="$1"
-	local enabled ip username password
+	local ipaddr username password port autokeysetup usekeyfile keyfile keyauth tmpfile runfile errfile success
 
 	config_get_bool enabled "$cfg" enabled 1
-	[ "$enabled" -gt 0 ] || return 0
+	[ "$enabled" -eq 1 ] || return 0
 
 	config_get ipaddr "$cfg" ipaddr
-	config_get username "$cfg" username
-	[ -z "$ipaddr" ] || [ -z "$username" ] && return 0
+	config_get name "$cfg" name
+	[ -z "$ipaddr" ] && return 0
 
+	config_get username "$cfg" username
 	config_get password "$cfg" password
 	config_get port "$cfg" port 22
 
-	config_get usekeyfile "$cfg" usekeyfile 0
-	config_get keyfile "$cfg" keyfile "/root/.ssh/id_dropbear"
-
-	if [ "$usekeyfile" -eq 1 ] && [ -e "$keyfile" ]; then
-		scp -i ${keyfile} -o StrictHostKeyChecking=no -P ${port} /usr/share/apcontroller/apcontroller-agent ${username}@${ipaddr}:/tmp 2>/dev/null
-		[ $? -eq 0 ] && ssh -q -i ${keyfile} -o StrictHostKeyChecking=no -p ${port} ${username}@${ipaddr} "/tmp/apcontroller-agent" > ${BASEPATH}/${ipaddr}-${cfg} 2>/dev/null
+	config_get_bool autokeysetup "$cfg" autokeysetup 0
+	config_get_bool usekeyfile "$cfg" usekeyfile 0
+	config_get keyfile "$cfg" keyfile
+	if [ "$autokeysetup" = "1" ]; then
+		keyfile="$(default_keyfile "$cfg")"
+		keyauth=1
 	else
-		sshpass -p "${password}" scp -o StrictHostKeyChecking=no -P ${port} /usr/share/apcontroller/apcontroller-agent ${username}@${ipaddr}:/tmp 2>/dev/null
-		[ $? -eq 0 ] && sshpass -p "${password}" ssh -q -o StrictHostKeyChecking=no -p ${port} ${username}@${ipaddr} "/tmp/apcontroller-agent" > ${BASEPATH}/${ipaddr}-${cfg} 2>/dev/null
+		keyfile="$(normalize_keyfile "$cfg" "$keyfile")"
+		keyauth="$usekeyfile"
 	fi
-	NOW=$(date "+%s")
-	VAL=0
-	if [ -s "${BASEPATH}/${ipaddr}-${cfg}" ]; then
-		TIMESTAMP=$(date +%s -r ${BASEPATH}/${ipaddr}-${cfg})
-		D=$((NOW - TIMESTAMP))
-		[ $D -le 60 ] && VAL=1
+
+	tmpfile="${BASEPATH}/${ipaddr}-${cfg}"
+	runfile="${tmpfile}.new.$$"
+	errfile="${BASEPATH}/${ipaddr}-${cfg}.err"
+	success=0
+	rm -f "$errfile" "$runfile"
+
+	# Common SSH options
+	SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=10"
+	SCP_OPTS="-O -B"
+
+	if [ "$keyauth" = "1" ]; then
+		if [ ! -e "$keyfile" ]; then
+			if [ "$autokeysetup" = "1" ]; then
+				setup_missing_key "$cfg" "$ipaddr" "$keyfile" "$errfile" "$password"
+			else
+				log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Custom key file '${keyfile}' is missing. Aborting key auth."
+			fi
+		fi
+
+		if [ -e "$keyfile" ]; then
+			if command -v dbclient >/dev/null 2>&1 && dropbearkey -y -f "$keyfile" >/dev/null 2>&1; then
+				DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=accept-new -p ${port} -l ${username}"
+				if dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent && chmod 755 /tmp/apcontroller-agent" < /usr/share/apcontroller/apcontroller-agent 2>"$errfile" && \
+				   dbclient $DBCLIENT_OPTS "$ipaddr" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
+					success=1
+				else
+					log_apcontroller "Host '$cfg' (${ipaddr}) dropbear key auth failed: $(tr '\n' ' ' < "$errfile")"
+				fi
+			else
+				if scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P "${port}" /usr/share/apcontroller/apcontroller-agent "${username}@${ipaddr}:/tmp" 2>"$errfile" && \
+				   ssh -q -i "${keyfile}" $SSH_OPTS -o PreferredAuthentications=publickey -p "${port}" "${username}@${ipaddr}" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
+					success=1
+				else
+					log_apcontroller "Host '$cfg' (${ipaddr}) key auth failed: $(tr '\n' ' ' < "$errfile")"
+				fi
+			fi
+		fi
 	fi
-	# log only day/hour
-	NOW=$(date +%s -d "$(date -d @"$NOW" "+%Y-%m-%d %H:00")")
-	touch "${BASEPATH}/${ipaddr}.txt"
-	grep -q "$NOW $VAL" "${BASEPATH}/${ipaddr}.txt" || echo "$NOW $VAL" >> "${BASEPATH}/${ipaddr}.txt"
+
+	if [ "$keyauth" != "1" ]; then
+		# Password auth
+		PASS_SSH_OPTS="-o StrictHostKeyChecking=no -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=10"
+		PASS_SCP_OPTS="-O"
+		if sshpass -p "${password}" scp $PASS_SCP_OPTS $PASS_SSH_OPTS -P "${port}" /usr/share/apcontroller/apcontroller-agent "${username}@${ipaddr}:/tmp" 2>"$errfile" && \
+		   sshpass -p "${password}" ssh -q $PASS_SSH_OPTS -p "${port}" "${username}@${ipaddr}" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
+			success=1
+		else
+			log_apcontroller "Host '$cfg' (${ipaddr}) password auth failed: $(tr '\n' ' ' < "$errfile")"
+		fi
+	fi
+
+	if [ "$success" -eq 1 ] && [ -s "$runfile" ]; then
+		mv -f "$runfile" "$tmpfile"
+		# Safe awk call
+		VAL=$(awk -F: '{print $4}' "$tmpfile" 2>/dev/null)
+		NOW=$(date +%s)
+		[ -z "$VAL" ] || grep -q "$VAL" "${BASEPATH}/${ipaddr}.txt" 2>/dev/null || echo "$NOW $VAL" >> "${BASEPATH}/${ipaddr}.txt"
+	fi
+	rm -f "$runfile" "$errfile"
 }
 
 T=$(uci -q get apcontroller.@global[0].path)

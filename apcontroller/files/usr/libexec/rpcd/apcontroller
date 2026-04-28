@@ -12,10 +12,41 @@ mkdir -p "$BASEPATH"
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
 
+DEBUG_LOG="/tmp/apcontroller_setup.debug"
+
+log_apcontroller() {
+	logger -t apcontroller "$*"
+	echo "$(date): $*" >> "$DEBUG_LOG"
+}
+
+default_keyfile() {
+	echo "/root/.ssh/id_apc_$1"
+}
+
+normalize_keyfile() {
+	local section="$1"
+	local keyfile="$2"
+	local default
+
+	default="$(default_keyfile "$section")"
+
+	case "$keyfile" in
+		""|"/root/.ssh/id_dropbear")
+			echo "$default"
+			;;
+		/root/.ssh/id_apc_*)
+			[ "$keyfile" = "$default" ] && echo "$keyfile" || echo "$default"
+			;;
+		*)
+			echo "$keyfile"
+			;;
+	esac
+}
+
 show_data_from_host() {
 	local cfg="$1"
 	local oldns
-	local hostname model load uptime mac software ssid
+	local hostname model load uptime mac software ssid autokeysetup usekeyfile keyfile keyauth authmode interval stale_after status pingstatus sshstatus
 
 	config_get_bool enabled "$cfg" enabled 1
 	config_get name "$cfg" name
@@ -23,6 +54,34 @@ show_data_from_host() {
 	config_get port "$cfg" port 22
 	config_get username "$cfg" username
 	config_get password "$cfg" password
+	config_get_bool autokeysetup "$cfg" autokeysetup 0
+	config_get_bool usekeyfile "$cfg" usekeyfile 0
+	config_get keyfile "$cfg" keyfile
+
+	if [ "$autokeysetup" = "1" ]; then
+		keyfile="$(default_keyfile "$cfg")"
+		keyauth=1
+	else
+		keyfile="$(normalize_keyfile "$cfg" "$keyfile")"
+		keyauth="$usekeyfile"
+	fi
+
+	authmode="password"
+	if [ "$keyauth" = "1" ]; then
+		if [ -e "$keyfile" ]; then
+			[ "$autokeysetup" = "1" ] && authmode="auto_key" || authmode="key"
+		else
+			[ "$autokeysetup" = "1" ] && authmode="auto_key_missing" || authmode="key_missing"
+		fi
+	fi
+
+	interval=$(uci -q get apcontroller.@global[0].interval)
+	[ -n "$interval" ] || interval=5
+	case "$interval" in *[!0-9]*) interval=5 ;; esac
+	stale_after=$((interval * 60 + 30))
+	status="unknown"
+	pingstatus="unknown"
+	sshstatus="unknown"
 
 	json_add_object
 	json_add_string "section" "$cfg"
@@ -32,6 +91,10 @@ show_data_from_host() {
 	json_add_int "port" "$port"
 	json_add_string "username" "$username"
 	json_add_string "password" "$password"
+	json_add_boolean "autokeysetup" "$autokeysetup"
+	json_add_boolean "usekeyfile" "$usekeyfile"
+	json_add_string "keyfile" "$keyfile"
+	json_add_string "authmode" "$authmode"
 
 	LASTCONTACT=-1
 	if [ -s "${BASEPATH}/${ipaddr}-${cfg}" ] && [ "$enabled" = "1" ]; then
@@ -49,9 +112,7 @@ show_data_from_host() {
 				json_set_namespace $oldns
 				json_add_array "clientslist${BAND}"
 				json_set_namespace host oldns
-
 				json_select "clientslist${BAND}"
-
 				idx=1
 				while json_is_a $idx object; do
 					json_select $idx
@@ -64,7 +125,6 @@ show_data_from_host() {
 					json_get_var _wifi "wifi"
 					json_get_var _ipaddr "ipaddr"
 					json_get_var _name "name"
-
 					json_set_namespace $oldns
 					json_add_object
 					json_add_string "ssid" "$_ssid"
@@ -78,22 +138,17 @@ show_data_from_host() {
 					json_add_string "name" "$_name"
 					json_close_object
 					json_set_namespace host oldns
-
 					json_select ..
 					idx=$(( idx + 1 ))
 				done
-
 				json_set_namespace $oldns
 				json_close_array
 				json_set_namespace host oldns
-
 				json_select ..
 			fi
 		done
-
 		json_cleanup
 		json_set_namespace $oldns
-
 		json_add_string "hostname" "$hostname"
 		json_add_string "model" "$model"
 		json_add_string "load" "$load"
@@ -104,37 +159,56 @@ show_data_from_host() {
 		[ -n "$channels5g" ] && json_add_string "channels5g" "$channels5g"
 		[ -n "$channels6g" ] && json_add_string "channels6g" "$channels6g"
 	fi
+	if [ "$enabled" != "1" ]; then
+		status="disabled"
+		sshstatus="disabled"
+	elif [ -z "$ipaddr" ]; then
+		status="unknown"
+	elif [ "$LASTCONTACT" -ge 0 ] && [ "$LASTCONTACT" -le "$stale_after" ]; then
+		status="online"
+		sshstatus="ok"
+	else
+		sshstatus="failed"
+		if ping -4 -c 1 -W 1 "$ipaddr" >/dev/null 2>&1; then
+			status="ssh_failed"
+			pingstatus="ok"
+		else
+			status="offline"
+			pingstatus="failed"
+		fi
+	fi
+	json_add_string "status" "$status"
+	json_add_string "pingstatus" "$pingstatus"
+	json_add_string "sshstatus" "$sshstatus"
+	json_add_int "stale_after" "$stale_after"
 	json_add_int "lastcontact" "$LASTCONTACT"
-
 	json_close_object
 }
 
 show_activity() {
-	read input
-	json_load "$input"
+	read input; json_load "$input"
 	json_get_var section section
-
 	json_init
-
 	ipaddr=$(uci_get "apcontroller" "$section" "ipaddr" "")
 	enabled=$(uci_get "apcontroller" "$section" "enabled" "0")
 	json_add_array "activity"
 	if [ -n "$ipaddr" ] && [ -s "${BASEPATH}/${ipaddr}.txt" ] && [ "$enabled" = "1" ]; then
+		ACTIVITY_TMP="${BASEPATH}/${ipaddr}.activity.$$"
+		tail -n 672 "${BASEPATH}/${ipaddr}.txt" > "$ACTIVITY_TMP"
 		while read -r LINE; do
 			set -- $LINE
 			json_add_object
 			json_add_int "timestamp" $1
 			json_add_int "value" $2
 			json_close_object
-		done < <(tail -n 672 "${BASEPATH}/${ipaddr}.txt")
+		done < "$ACTIVITY_TMP"
+		rm -f "$ACTIVITY_TMP"
 	fi
-	json_close_array
-	json_dump
+	json_close_array; json_dump
 }
 
 show_scripts() {
-	json_init
-	json_add_array "scripts"
+	json_init; json_add_array "scripts"
 	for FILE in $(find /usr/share/apcontroller/scripts -type f); do
 		DESC=$(awk '/^#desc:/{gsub("#desc:", "");print $0}' "$FILE" | head -n1)
 		grep -q "^#warn" "$FILE" && WARN=1 || WARN=0
@@ -145,48 +219,147 @@ show_scripts() {
 		json_add_int "warn" $WARN
 		json_close_object
 	done
-	json_close_array
-	json_dump
+	json_close_array; json_dump
 }
 
 show_status() {
 	config_load apcontroller
-	json_init
-	json_add_array "hosts"
+	json_init; json_add_array "hosts"
 	config_foreach show_data_from_host host
-	json_close_array
-	json_dump
+	json_close_array; json_dump
+}
+
+ssh_setup() {
+	read input; json_load "$input"
+	json_get_var section section
+	json_get_var ipaddr ipaddr
+	json_get_var username username
+	json_get_var password password
+	json_get_var port port
+	json_get_var keyfile keyfile
+
+	config_load apcontroller
+	[ -z "$ipaddr" ] && config_get ipaddr "$section" ipaddr
+	[ -z "$username" ] && config_get username "$section" username
+	[ -z "$password" ] && config_get password "$section" password
+	[ -z "$port" ] && config_get port "$section" port 22
+	[ -z "$keyfile" ] && keyfile="$(default_keyfile "$section")"
+	keyfile="$(normalize_keyfile "$section" "$keyfile")"
+
+	if [ -z "$ipaddr" ] || [ -z "$username" ] || [ -z "$password" ]; then
+		log_apcontroller "Aborted: Missing required info (IP=$ipaddr, User=$username, Pass=***)"
+		json_init; json_add_string "error" "Missing credentials"; json_dump; return
+	fi
+
+	log_apcontroller "--- Setup for $section ($ipaddr) ---"
+	mkdir -p "$(dirname "$keyfile")"
+
+	if [ ! -f "$keyfile" ]; then
+		log_apcontroller "Generating new key: $keyfile"
+		if ! command -v dropbearkey >/dev/null 2>&1; then
+			log_apcontroller "Key generation failed: dropbearkey is missing"
+			json_init; json_add_string "error" "dropbearkey is required"; json_dump; return
+		fi
+
+		TMPKEY="${keyfile}.new.$$"
+		KEYGEN_ERR="${BASEPATH}/dropbearkey-${section}.err"
+		rm -f "$TMPKEY" "$keyfile.pub" "$KEYGEN_ERR"
+
+		if dropbearkey -t ed25519 -f "$TMPKEY" >"$KEYGEN_ERR" 2>&1 || dropbearkey -t rsa -s 3072 -f "$TMPKEY" >"$KEYGEN_ERR" 2>&1; then
+			PUBKEY=$(dropbearkey -y -f "$TMPKEY" 2>/dev/null | grep -E "^ssh-(rsa|ed25519) " | head -n 1)
+			if [ -z "$PUBKEY" ]; then
+				rm -f "$TMPKEY" "$KEYGEN_ERR"
+				log_apcontroller "Failed to extract public key from generated dropbear key"
+				json_init; json_add_string "error" "Pubkey extraction failed"; json_dump; return
+			fi
+
+			mv -f "$TMPKEY" "$keyfile"
+			printf '%s\n' "$PUBKEY" > "$keyfile.pub"
+			chmod 600 "$keyfile"
+			chmod 600 "$keyfile.pub"
+			rm -f "$KEYGEN_ERR"
+			log_apcontroller "Dropbear key file created."
+		else
+			ERR_MSG="$(tr '\n' ' ' < "$KEYGEN_ERR" 2>/dev/null)"
+			rm -f "$TMPKEY" "$KEYGEN_ERR"
+			log_apcontroller "dropbearkey failed: ${ERR_MSG:-unknown error}"
+			json_init; json_add_string "error" "Key gen failed"; json_dump; return
+		fi
+	fi
+
+	PUBKEY=""
+	[ -f "$keyfile.pub" ] && PUBKEY=$(grep -E "^ssh-(rsa|ed25519) " "$keyfile.pub" | head -n 1)
+	if [ -z "$PUBKEY" ] && [ -x /usr/libexec/ssh-keygen-openssh ]; then
+		PUBKEY=$(/usr/libexec/ssh-keygen-openssh -y -f "$keyfile" 2>/dev/null | grep -E "^ssh-(rsa|ed25519) " | head -n 1)
+	fi
+	if [ -z "$PUBKEY" ]; then
+		PUBKEY=$(dropbearkey -y -f "$keyfile" 2>/dev/null | grep -E "^ssh-(rsa|ed25519) " | head -n 1)
+	fi
+
+	if [ -z "$PUBKEY" ]; then
+		log_apcontroller "Failed to extract public key from $keyfile"
+		json_init; json_add_string "error" "Pubkey extraction failed"; json_dump; return
+	fi
+
+	mkdir -p /root/.ssh; touch /root/.ssh/known_hosts
+	sed -i "/^$ipaddr /d" /root/.ssh/known_hosts
+	ssh-keyscan -p "$port" "$ipaddr" >> /root/.ssh/known_hosts 2>/dev/null
+
+	PASS_SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+	KEY_SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o ConnectTimeout=10 -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+	DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=accept-new -p ${port} -l ${username}"
+
+	log_apcontroller "Pushing pubkey to AP..."
+	sshpass -p "$password" ssh $PASS_SSH_OPTS -p "$port" "${username}@$ipaddr" \
+		"umask 077; mkdir -p /etc/dropbear && touch /etc/dropbear/authorized_keys && chmod 600 /etc/dropbear/authorized_keys && { grep -qF '$PUBKEY' /etc/dropbear/authorized_keys || printf '%s\n' '$PUBKEY' >> /etc/dropbear/authorized_keys; }" >/dev/null 2>&1
+
+	if [ $? -eq 0 ]; then
+		log_apcontroller "Verifying login with key..."
+		if command -v dbclient >/dev/null 2>&1 && dropbearkey -y -f "$keyfile" >/dev/null 2>&1; then
+			dbclient $DBCLIENT_OPTS "$ipaddr" "true" >/dev/null 2>&1
+			VERIFY_RC=$?
+		else
+			ssh -q -i "$keyfile" $KEY_SSH_OPTS -o PreferredAuthentications=publickey -p "$port" "${username}@$ipaddr" "true" >/dev/null 2>&1
+			VERIFY_RC=$?
+		fi
+
+		if [ "$VERIFY_RC" -eq 0 ]; then
+			uci set apcontroller."$section".autokeysetup='1'
+			uci set apcontroller."$section".keyfile="$keyfile"
+			uci commit apcontroller
+			log_apcontroller "SUCCESS"
+			json_init; json_add_string "result" "success"; json_dump
+		else
+			log_apcontroller "Verification failed."
+			json_init; json_add_string "error" "Auth failed after push"; json_dump
+		fi
+	else
+		log_apcontroller "Push failed (sshpass returned $?)."
+		json_init; json_add_string "error" "Deploy failed"; json_dump
+	fi
 }
 
 case "$1" in
 	list)
 		json_init
-
-		json_add_object "activity"
+		json_add_object "activity"; json_add_string "section" ""; json_close_object
+		json_add_object "scripts"; json_close_object
+		json_add_object "status"; json_close_object
+		json_add_object "ssh_setup"
 		json_add_string "section" ""
+		json_add_string "ipaddr" ""
+		json_add_string "username" ""
+		json_add_string "password" ""
+		json_add_string "port" ""
+		json_add_string "keyfile" ""
 		json_close_object
-
-		json_add_object "scripts"
-		json_close_object
-
-		json_add_object "status"
-		json_close_object
-
-		json_dump
-		;;
+		json_dump ;;
 	call)
 		case "$2" in
-			activity)
-				show_activity
-				;;
-			scripts)
-				show_scripts
-				;;
-			status)
-				show_status
-				;;
-		esac
-		;;
+			activity) show_activity ;;
+			scripts) show_scripts ;;
+			status) show_status ;;
+			ssh_setup) ssh_setup ;;
+		esac ;;
 esac
-
 exit 0

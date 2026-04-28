@@ -7,7 +7,7 @@
 				"/usr/share/apcontroller/apcontroller.user": [ "read" ]
 			},
 			"ubus": {
-				"apcontroller": [ "activity", "scripts", "status" ],
+				"apcontroller": [ "activity", "scripts", "status", "ssh_setup" ],
 				"file": [ "read" ],
 				"luci-rpc": [ "getHostHints" ]
 			},
@@ -19,12 +19,15 @@
 				"/etc/init.d/cron reload": [ "exec" ],
 				"/usr/bin/apcontroller": [ "exec" ],
 				"/usr/bin/apcontroller-sendconfig": [ "exec" ],
+				"/usr/bin/dropbearkey": [ "exec" ],
+				"/usr/bin/ssh-keyscan": [ "exec" ],
 				"/usr/bin/scp": [ "exec" ],
 				"/usr/bin/ssh": [ "exec" ],
 				"/usr/bin/sshpass": [ "exec" ],
 				"/usr/share/apcontroller/apcontroller.user": [ "write" ]
 			},
 			"ubus": {
+				"apcontroller": [ "ssh_setup" ],
 				"file": [ "write" ]
 			},
 			"uci": [ "apcontroller" ]
