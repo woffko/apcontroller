@@ -83,6 +83,12 @@ function syncAutomaticSSHSetupUI(section_id) {
 	}
 }
 
+function scheduleAutomaticSSHSetupUI(section_id) {
+	[ 0, 50, 200 ].forEach(delay => {
+		setTimeout(() => syncAutomaticSSHSetupUI(section_id), delay);
+	});
+}
+
 callHostHints = rpc.declare({
 	object: 'luci-rpc',
 	method: 'getHostHints',
@@ -1105,9 +1111,9 @@ return view.extend({
 			}
 			if (input) {
 				input.addEventListener('change', () => {
-					setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+					scheduleAutomaticSSHSetupUI(section_id);
 				});
-				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+				scheduleAutomaticSSHSetupUI(section_id);
 			}
 			return widget;
 		};
@@ -1142,10 +1148,10 @@ return view.extend({
 				}
 				if (input) {
 					input.addEventListener('change', () => {
-						setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+						scheduleAutomaticSSHSetupUI(section_id);
 					});
 				}
-				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+				scheduleAutomaticSSHSetupUI(section_id);
 				return widget;
 			};
 
@@ -1184,7 +1190,7 @@ return view.extend({
 					input.readOnly = true;
 					input.title = _('Managed by Automatic SSH Key Setup');
 				}
-				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+				scheduleAutomaticSSHSetupUI(section_id);
 				return widget;
 			};
 		o.depends('autokeysetup', '1');

@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apcontroller
 PKG_VERSION:=20260111
-PKG_RELEASE:=305
+PKG_RELEASE:=306
 
 include $(INCLUDE_DIR)/package.mk
 
