@@ -24,23 +24,9 @@ default_keyfile() {
 }
 
 normalize_keyfile() {
-	local section="$1"
 	local keyfile="$2"
-	local default
 
-	default="$(default_keyfile "$section")"
-
-	case "$keyfile" in
-		""|"/root/.ssh/id_dropbear")
-			echo "$default"
-			;;
-		/root/.ssh/id_apc_*)
-			[ "$keyfile" = "$default" ] && echo "$keyfile" || echo "$default"
-			;;
-		*)
-			echo "$keyfile"
-			;;
-	esac
+	[ -n "$keyfile" ] && echo "$keyfile" || echo "/root/.ssh/id_dropbear"
 }
 
 show_data_from_host() {
@@ -56,7 +42,7 @@ show_data_from_host() {
 	config_get password "$cfg" password
 	config_get_bool autokeysetup "$cfg" autokeysetup 0
 	config_get_bool usekeyfile "$cfg" usekeyfile 0
-	config_get keyfile "$cfg" keyfile
+	config_get keyfile "$cfg" keyfile "/root/.ssh/id_dropbear"
 
 	if [ "$autokeysetup" = "1" ]; then
 		keyfile="$(default_keyfile "$cfg")"
@@ -243,8 +229,14 @@ ssh_setup() {
 	[ -z "$username" ] && config_get username "$section" username
 	[ -z "$password" ] && config_get password "$section" password
 	[ -z "$port" ] && config_get port "$section" port 22
-	[ -z "$keyfile" ] && keyfile="$(default_keyfile "$section")"
-	keyfile="$(normalize_keyfile "$section" "$keyfile")"
+	case "$keyfile" in
+		""|"/root/.ssh/id_dropbear")
+			keyfile="$(default_keyfile "$section")"
+			;;
+		/root/.ssh/id_apc_*)
+			[ "$keyfile" = "$(default_keyfile "$section")" ] || keyfile="$(default_keyfile "$section")"
+			;;
+	esac
 
 	if [ -z "$ipaddr" ] || [ -z "$username" ] || [ -z "$password" ]; then
 		log_apcontroller "Aborted: Missing required info (IP=$ipaddr, User=$username, Pass=***)"

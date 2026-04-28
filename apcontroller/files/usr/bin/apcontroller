@@ -17,23 +17,9 @@ default_keyfile() {
 }
 
 normalize_keyfile() {
-	local section="$1"
 	local keyfile="$2"
-	local default
 
-	default="$(default_keyfile "$section")"
-
-	case "$keyfile" in
-		""|"/root/.ssh/id_dropbear")
-			echo "$default"
-			;;
-		/root/.ssh/id_apc_*)
-			[ "$keyfile" = "$default" ] && echo "$keyfile" || echo "$default"
-			;;
-		*)
-			echo "$keyfile"
-			;;
-	esac
+	[ -n "$keyfile" ] && echo "$keyfile" || echo "/root/.ssh/id_dropbear"
 }
 
 setup_missing_key() {
@@ -82,7 +68,7 @@ get_data_from_host() {
 
 	config_get_bool autokeysetup "$cfg" autokeysetup 0
 	config_get_bool usekeyfile "$cfg" usekeyfile 0
-	config_get keyfile "$cfg" keyfile
+	config_get keyfile "$cfg" keyfile "/root/.ssh/id_dropbear"
 	if [ "$autokeysetup" = "1" ]; then
 		keyfile="$(default_keyfile "$cfg")"
 		keyauth=1

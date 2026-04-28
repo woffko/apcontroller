@@ -17,6 +17,10 @@ function defaultKeyfile(section_id) {
 	return '/root/.ssh/id_apc_' + section_id;
 }
 
+function defaultManualKeyfile() {
+	return '/root/.ssh/id_dropbear';
+}
+
 function addUnique(list, value) {
 	if (value && !list.includes(value))
 		list.push(value);
@@ -28,6 +32,14 @@ function flagEnabled(value) {
 
 function optionInput(section_id, option) {
 	return document.getElementById('cbid.apcontroller.' + section_id + '.' + option);
+}
+
+function automaticSSHSetupSelected(section_id, map) {
+	const input = optionInput(section_id, 'autokeysetup');
+	if (input)
+		return input.checked;
+
+	return flagEnabled(map.data.get('apcontroller', section_id, 'autokeysetup'));
 }
 
 function syncAutomaticSSHSetupUI(section_id) {
@@ -63,8 +75,10 @@ function syncAutomaticSSHSetupUI(section_id) {
 				keyfileInput.dataset.manualValue = keyfileInput.value || '';
 			keyfileInput.value = defaultKeyfile(section_id);
 		} else if (keyfileInput.dataset.manualValue != null) {
-			keyfileInput.value = keyfileInput.dataset.manualValue;
+			keyfileInput.value = keyfileInput.dataset.manualValue || (useKeyInput && useKeyInput.checked ? defaultManualKeyfile() : '');
 			delete keyfileInput.dataset.manualValue;
+		} else if (useKeyInput && useKeyInput.checked && !keyfileInput.value) {
+			keyfileInput.value = defaultManualKeyfile();
 		}
 	}
 }
@@ -911,7 +925,7 @@ return view.extend({
 									}
 									let cmd = '';
 									let args = [];
-									const actionKeyfile = flagEnabled(row['autokeysetup']) ? defaultKeyfile(section_id) : row['keyfile'];
+									const actionKeyfile = flagEnabled(row['autokeysetup']) ? defaultKeyfile(section_id) : (row['keyfile'] || defaultManualKeyfile());
 									const actionUseKey = flagEnabled(row['autokeysetup']) || (row['usekeyfile'] && actionKeyfile);
 									if (actionUseKey && actionKeyfile) {
 											cmd = 'scp';
@@ -1108,12 +1122,12 @@ return view.extend({
 				return form.Flag.prototype.cfgvalue.apply(this, arguments);
 			};
 			o.write = function(section_id, value) {
-				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+				if (automaticSSHSetupSelected(section_id, this.map))
 					return;
 				return form.Flag.prototype.write.apply(this, arguments);
 			};
 			o.remove = function(section_id) {
-				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+				if (automaticSSHSetupSelected(section_id, this.map))
 					return;
 				return form.Flag.prototype.remove.apply(this, arguments);
 			};
@@ -1126,6 +1140,11 @@ return view.extend({
 					input.parentElement.title = _('Enabled by Automatic SSH Key Setup');
 					input.parentElement.style.opacity = '0.6';
 				}
+				if (input) {
+					input.addEventListener('change', () => {
+						setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
+					});
+				}
 				setTimeout(() => syncAutomaticSSHSetupUI(section_id), 0);
 				return widget;
 			};
@@ -1137,20 +1156,23 @@ return view.extend({
 			o.placeholder = function(section_id) {
 				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
 					return defaultKeyfile(section_id);
-				return '/root/.ssh/id_custom';
+				return defaultManualKeyfile();
 			};
 			o.cfgvalue = function(section_id) {
 				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
 					return defaultKeyfile(section_id);
-				return this.map.data.get('apcontroller', section_id, 'keyfile');
+				const value = this.map.data.get('apcontroller', section_id, 'keyfile');
+				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'usekeyfile')))
+					return value || defaultManualKeyfile();
+				return value;
 			};
 			o.write = function(section_id, value) {
-				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+				if (automaticSSHSetupSelected(section_id, this.map))
 					return;
 				return form.Value.prototype.write.apply(this, arguments);
 			};
 			o.remove = function(section_id) {
-				if (flagEnabled(this.map.data.get('apcontroller', section_id, 'autokeysetup')))
+				if (automaticSSHSetupSelected(section_id, this.map))
 					return;
 				return form.Value.prototype.remove.apply(this, arguments);
 			};

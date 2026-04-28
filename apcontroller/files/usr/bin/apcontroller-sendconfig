@@ -25,23 +25,9 @@ default_keyfile() {
 }
 
 normalize_keyfile() {
-	local section="$1"
 	local keyfile="$2"
-	local default
 
-	default="$(default_keyfile "$section")"
-
-	case "$keyfile" in
-		""|"/root/.ssh/id_dropbear")
-			echo "$default"
-			;;
-		/root/.ssh/id_apc_*)
-			[ "$keyfile" = "$default" ] && echo "$keyfile" || echo "$default"
-			;;
-		*)
-			echo "$keyfile"
-			;;
-	esac
+	[ -n "$keyfile" ] && echo "$keyfile" || echo "/root/.ssh/id_dropbear"
 }
 
 setup_missing_key() {
@@ -126,6 +112,7 @@ for HOST in $HOSTS; do
 	autokeysetup=$(uci -q get apcontroller."$HOST".autokeysetup)
 	usekeyfile=$(uci -q get apcontroller."$HOST".usekeyfile)
 	keyfile=$(uci -q get apcontroller."$HOST".keyfile)
+	[ -n "$keyfile" ] || keyfile="/root/.ssh/id_dropbear"
 	if [ "x$autokeysetup" = "x1" ]; then
 		keyfile="$(default_keyfile "$HOST")"
 		keyauth=1
