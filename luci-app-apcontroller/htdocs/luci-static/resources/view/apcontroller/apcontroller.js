@@ -262,6 +262,22 @@ return view.extend({
 		});
 	},
 
+	reinstallAPKeys: function() {
+		let setupSections = [];
+
+		uci.sections('apcontroller', 'host', function(host) {
+			if (flagEnabled(host.autokeysetup))
+				addUnique(setupSections, host['.name']);
+		});
+
+		if (setupSections.length === 0) {
+			ui.addNotification(null, E('p', _('No devices with automatic SSH key setup enabled')), 'warning');
+			return Promise.resolve();
+		}
+
+		return this.runSSHSetups(setupSections, true);
+	},
+
 	handleSave: function(ev) {
 		pendingSSHSetupSections = [];
 
@@ -576,6 +592,7 @@ return view.extend({
 			let m, s, o;
 			m = new form.Map('apcontroller', _('AP Controller'), _('Router and AP Management'));
 			this.map = m;
+			const viewSelf = this;
 			m.tabbed = true;
 
 
@@ -634,6 +651,21 @@ return view.extend({
 				]);
 				let e = nodes.querySelector('#cbi-apcontroller-host > h3');
 				if (e) e.parentNode.replaceChild(info, e);
+
+				const createEl = nodes.querySelector('#cbi-apcontroller-host > .cbi-section-create');
+				if (createEl && !createEl.querySelector('.apcontroller-reinstall-ap-keys')) {
+					createEl.style.display = 'flex';
+					createEl.style.gap = '8px';
+					createEl.style.justifyContent = 'flex-end';
+					createEl.style.alignItems = 'center';
+					createEl.style.flexWrap = 'wrap';
+					createEl.insertBefore(E('button', {
+						'class': 'cbi-button cbi-button-neutral apcontroller-reinstall-ap-keys',
+						'title': _('Reinstall AP keys'),
+						'click': ui.createHandlerFn(viewSelf, 'reinstallAPKeys'),
+						'disabled': viewSelf.map.readonly || null
+					}, [ _('Reinstall AP keys') ]), createEl.firstChild);
+				}
 
 				let clientsContainer = E('div', { id: 'clients-container', style: 'margin-top: 20px;' });
 				clientsContainer.appendChild(renderClientsTable(clients));
