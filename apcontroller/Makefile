@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apcontroller
 PKG_VERSION:=20260111
-PKG_RELEASE:=306
+PKG_RELEASE:=307
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -10,7 +10,7 @@ define Package/apcontroller
 	SECTION:=admin
 	CATEGORY:=Administration
 	TITLE:=AP Controller
-	DEPENDS:=+sshpass
+	DEPENDS:=+sshpass +openssh-client-utils
 	MAINTAINER:=Cezary Jackiewicz <cezary@eko.one.pl>
 	PKGARCH:=all
 endef
