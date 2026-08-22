@@ -12,16 +12,21 @@ VERBOSE=$2
 . /usr/share/libubox/jshn.sh
 
 BASEPATH="/tmp/apcontroller"
-T=$(uci -q get apcontroller.@global[0].path)
-[ -n "$T" ] && BASEPATH="$T"
+DBCLIENT_HOME="/etc/apcontroller"
+KNOWN_HOSTS="${DBCLIENT_HOME}/.ssh/known_hosts"
 mkdir -p "$BASEPATH"
+chmod 700 "$BASEPATH"
+mkdir -p "$DBCLIENT_HOME/.ssh"
+chmod 700 "$DBCLIENT_HOME" "$DBCLIENT_HOME/.ssh"
+touch "$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
 
 log_apcontroller() {
 	logger -t apcontroller-sendconfig "$*"
 }
 
 default_keyfile() {
-	echo "/root/.ssh/id_apc_$1"
+	echo "/etc/apcontroller/keys/id_apc_$1"
 }
 
 normalize_keyfile() {
@@ -30,34 +35,21 @@ normalize_keyfile() {
 	[ -n "$keyfile" ] && echo "$keyfile" || echo "/root/.ssh/id_dropbear"
 }
 
-setup_missing_key() {
-	local host="$1"
-	local name="$2"
-	local ipaddr="$3"
-	local keyfile="$4"
-	local errfile="$5"
-	local password="$6"
+valid_host() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
+}
 
-	if [ -z "$password" ]; then
-		log_apcontroller "Failed to send config to ${name} (${ipaddr}): Key file '${keyfile}' is missing and no password is stored for key setup."
-		return 1
-	fi
+valid_username() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._-]+$'
+}
 
-	if [ ! -x /usr/libexec/rpcd/apcontroller ]; then
-		log_apcontroller "Failed to send config to ${name} (${ipaddr}): Key file '${keyfile}' is missing and ssh_setup helper is unavailable."
-		return 1
-	fi
+valid_port() {
+	case "$1" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
 
-	log_apcontroller "Key file '${keyfile}' for ${name} (${ipaddr}) is missing; running SSH key setup."
-	printf '{"section":"%s"}\n' "$host" | /usr/libexec/rpcd/apcontroller call ssh_setup >"$errfile" 2>&1
-
-	if [ -e "$keyfile" ]; then
-		log_apcontroller "Key setup for ${name} (${ipaddr}) created '${keyfile}'."
-		return 0
-	fi
-
-	log_apcontroller "Failed to send config to ${name} (${ipaddr}): Key file '${keyfile}' is still missing after setup: $(tr '\n' ' ' < "$errfile")"
-	return 1
+valid_keyfile() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^(/etc/apcontroller/keys|/root/\.ssh)/[A-Za-z0-9._-]+$'
 }
 
 T=$(uci -q get apcontroller."$SEC")
@@ -106,7 +98,6 @@ for HOST in $HOSTS; do
 	[ -z "$port" ] && port=22
 	username=$(uci -q get apcontroller."$HOST".username)
 	[ -z "$username" ] && continue
-	password=$(uci -q get apcontroller."$HOST".password)
 	NAME=$(uci -q get apcontroller."$HOST".name)
 
 	autokeysetup=$(uci -q get apcontroller."$HOST".autokeysetup)
@@ -120,39 +111,37 @@ for HOST in $HOSTS; do
 		keyfile="$(normalize_keyfile "$HOST" "$keyfile")"
 		keyauth="$usekeyfile"
 	fi
+	if ! valid_host "$ipaddr" || ! valid_username "$username" || ! valid_port "$port" || ! valid_keyfile "$keyfile"; then
+		log_apcontroller "Failed to send config to ${NAME} (${ipaddr}): invalid SSH configuration."
+		continue
+	fi
 
 	# Common SSH options for compatibility with older Dropbear/RSA
-	SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=15"
+	SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=15"
 	SCP_OPTS="-O -B"
-	PASS_SSH_OPTS="-o StrictHostKeyChecking=no -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=15"
-	PASS_SCP_OPTS="-O"
 
 	rm -f "$ERRFILE"
 	T=1
 
 	if [ "x$keyauth" = "x1" ]; then
 		if [ ! -e "$keyfile" ]; then
-			if [ "x$autokeysetup" = "x1" ]; then
-				setup_missing_key "$HOST" "$NAME" "$ipaddr" "$keyfile" "$ERRFILE" "$password"
-			else
-				log_apcontroller "Failed to send config to ${NAME} (${ipaddr}): Custom key file '${keyfile}' is missing."
-			fi
+			log_apcontroller "Failed to send config to ${NAME} (${ipaddr}): Key file '${keyfile}' is missing. Run SSH key setup in LuCI."
 		fi
 
 		if [ -e "$keyfile" ]; then
 			if command -v dbclient >/dev/null 2>&1 && dropbearkey -y -f "$keyfile" >/dev/null 2>&1; then
-				DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=accept-new -p ${port} -l ${username}"
+				DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=yes -p ${port} -l ${username}"
 				if [ "x$USEAS" = "x1" ]; then
-					dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller.user && chmod 755 /tmp/apcontroller.user" < /usr/share/apcontroller/apcontroller.user 2>"$ERRFILE" && \
-					dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent-as && chmod 755 /tmp/apcontroller-agent-as" < /usr/share/apcontroller/apcontroller-agent-as 2>>"$ERRFILE"
+					HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller.user && chmod 755 /tmp/apcontroller.user" < /usr/share/apcontroller/apcontroller.user 2>"$ERRFILE" && \
+					HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent-as && chmod 755 /tmp/apcontroller-agent-as" < /usr/share/apcontroller/apcontroller-agent-as 2>>"$ERRFILE"
 					T=$?
 				else
 					T=0
 				fi
 				[ "$T" -eq 0 ] && \
-				dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/cmds-${SEC}" < ${BASEPATH}/cmds-${SEC} 2>>"$ERRFILE" && \
-				dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent-setconfig && chmod 755 /tmp/apcontroller-agent-setconfig" < /usr/share/apcontroller/apcontroller-agent-setconfig 2>>"$ERRFILE" && \
-				dbclient $DBCLIENT_OPTS "$ipaddr" "/tmp/apcontroller-agent-setconfig /tmp/cmds-${SEC}" 2>>"$ERRFILE"
+				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/cmds-${SEC}" < ${BASEPATH}/cmds-${SEC} 2>>"$ERRFILE" && \
+				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent-setconfig && chmod 755 /tmp/apcontroller-agent-setconfig" < /usr/share/apcontroller/apcontroller-agent-setconfig 2>>"$ERRFILE" && \
+				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "/tmp/apcontroller-agent-setconfig /tmp/cmds-${SEC}" 2>>"$ERRFILE"
 				T=$?
 			else
 				if [ "x$USEAS" = "x1" ]; then
@@ -170,15 +159,8 @@ for HOST in $HOSTS; do
 	fi
 
 	if [ "x$keyauth" != "x1" ]; then
-		# Password auth only if key auth is disabled
-		if [ "x$USEAS" = "x1" ]; then
-			sshpass -p "${password}" scp $PASS_SCP_OPTS $PASS_SSH_OPTS -P ${port} /usr/share/apcontroller/apcontroller.user "${username}@${ipaddr}:/tmp" 2>"$ERRFILE"
-			sshpass -p "${password}" scp $PASS_SCP_OPTS $PASS_SSH_OPTS -P ${port} /usr/share/apcontroller/apcontroller-agent-as "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE"
-		fi
-		sshpass -p "${password}" scp $PASS_SCP_OPTS $PASS_SSH_OPTS -P ${port} ${BASEPATH}/cmds-${SEC} "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE" && \
-		sshpass -p "${password}" scp $PASS_SCP_OPTS $PASS_SSH_OPTS -P ${port} /usr/share/apcontroller/apcontroller-agent-setconfig "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE" && \
-		sshpass -p "${password}" ssh -q $PASS_SSH_OPTS -p ${port} "${username}@${ipaddr}" "/tmp/apcontroller-agent-setconfig /tmp/cmds-${SEC}" 2>>"$ERRFILE"
-		T=$?
+		log_apcontroller "Failed to send config to ${NAME} (${ipaddr}): SSH key authentication is required."
+		T=1
 	fi
 
 	if [ "$T" -ne 0 ]; then

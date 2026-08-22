@@ -5,6 +5,8 @@
 #
 
 BASEPATH="/tmp/apcontroller"
+DBCLIENT_HOME="/etc/apcontroller"
+KNOWN_HOSTS="${DBCLIENT_HOME}/.ssh/known_hosts"
 
 . /lib/functions.sh
 
@@ -13,7 +15,7 @@ log_apcontroller() {
 }
 
 default_keyfile() {
-	echo "/root/.ssh/id_apc_$1"
+	echo "/etc/apcontroller/keys/id_apc_$1"
 }
 
 normalize_keyfile() {
@@ -22,38 +24,26 @@ normalize_keyfile() {
 	[ -n "$keyfile" ] && echo "$keyfile" || echo "/root/.ssh/id_dropbear"
 }
 
-setup_missing_key() {
-	local cfg="$1"
-	local ipaddr="$2"
-	local keyfile="$3"
-	local errfile="$4"
-	local password="$5"
+valid_host() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
+}
 
-	if [ -z "$password" ]; then
-		log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' missing and no password is stored for key setup. Aborting."
-		return 1
-	fi
+valid_username() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._-]+$'
+}
 
-	if [ ! -x /usr/libexec/rpcd/apcontroller ]; then
-		log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' missing and ssh_setup helper is unavailable. Aborting."
-		return 1
-	fi
+valid_port() {
+	case "$1" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
 
-	log_apcontroller "Host '$cfg' (${ipaddr}) key file '${keyfile}' missing; running SSH key setup."
-	printf '{"section":"%s"}\n' "$cfg" | /usr/libexec/rpcd/apcontroller call ssh_setup >"$errfile" 2>&1
-
-	if [ -e "$keyfile" ]; then
-		log_apcontroller "Host '$cfg' (${ipaddr}) key setup created '${keyfile}'."
-		return 0
-	fi
-
-	log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' missing after setup: $(tr '\n' ' ' < "$errfile")"
-	return 1
+valid_keyfile() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^(/etc/apcontroller/keys|/root/\.ssh)/[A-Za-z0-9._-]+$'
 }
 
 get_data_from_host() {
 	local cfg="$1"
-	local ipaddr username password port autokeysetup usekeyfile keyfile keyauth tmpfile runfile errfile success
+	local ipaddr username port autokeysetup usekeyfile keyfile keyauth tmpfile runfile errfile success
 
 	config_get_bool enabled "$cfg" enabled 1
 	[ "$enabled" -eq 1 ] || return 0
@@ -63,7 +53,6 @@ get_data_from_host() {
 	[ -z "$ipaddr" ] && return 0
 
 	config_get username "$cfg" username
-	config_get password "$cfg" password
 	config_get port "$cfg" port 22
 
 	config_get_bool autokeysetup "$cfg" autokeysetup 0
@@ -76,6 +65,10 @@ get_data_from_host() {
 		keyfile="$(normalize_keyfile "$cfg" "$keyfile")"
 		keyauth="$usekeyfile"
 	fi
+	if ! valid_host "$ipaddr" || ! valid_username "$username" || ! valid_port "$port" || ! valid_keyfile "$keyfile"; then
+		log_apcontroller "Host '$cfg' has invalid SSH configuration."
+		return 1
+	fi
 
 	tmpfile="${BASEPATH}/${ipaddr}-${cfg}"
 	runfile="${tmpfile}.new.$$"
@@ -84,23 +77,19 @@ get_data_from_host() {
 	rm -f "$errfile" "$runfile"
 
 	# Common SSH options
-	SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=10"
+	SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=10"
 	SCP_OPTS="-O -B"
 
 	if [ "$keyauth" = "1" ]; then
 		if [ ! -e "$keyfile" ]; then
-			if [ "$autokeysetup" = "1" ]; then
-				setup_missing_key "$cfg" "$ipaddr" "$keyfile" "$errfile" "$password"
-			else
-				log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Custom key file '${keyfile}' is missing. Aborting key auth."
-			fi
+			log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: Key file '${keyfile}' is missing. Run SSH key setup in LuCI."
 		fi
 
 		if [ -e "$keyfile" ]; then
 			if command -v dbclient >/dev/null 2>&1 && dropbearkey -y -f "$keyfile" >/dev/null 2>&1; then
-				DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=accept-new -p ${port} -l ${username}"
-				if dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent && chmod 755 /tmp/apcontroller-agent" < /usr/share/apcontroller/apcontroller-agent 2>"$errfile" && \
-				   dbclient $DBCLIENT_OPTS "$ipaddr" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
+				DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=yes -p ${port} -l ${username}"
+				if HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent && chmod 755 /tmp/apcontroller-agent" < /usr/share/apcontroller/apcontroller-agent 2>"$errfile" && \
+				   HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
 					success=1
 				else
 					log_apcontroller "Host '$cfg' (${ipaddr}) dropbear key auth failed: $(tr '\n' ' ' < "$errfile")"
@@ -117,15 +106,7 @@ get_data_from_host() {
 	fi
 
 	if [ "$keyauth" != "1" ]; then
-		# Password auth
-		PASS_SSH_OPTS="-o StrictHostKeyChecking=no -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=10"
-		PASS_SCP_OPTS="-O"
-		if sshpass -p "${password}" scp $PASS_SCP_OPTS $PASS_SSH_OPTS -P "${port}" /usr/share/apcontroller/apcontroller-agent "${username}@${ipaddr}:/tmp" 2>"$errfile" && \
-		   sshpass -p "${password}" ssh -q $PASS_SSH_OPTS -p "${port}" "${username}@${ipaddr}" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
-			success=1
-		else
-			log_apcontroller "Host '$cfg' (${ipaddr}) password auth failed: $(tr '\n' ' ' < "$errfile")"
-		fi
+		log_apcontroller "Host '$cfg' (${ipaddr}) ERROR: SSH key authentication is required."
 	fi
 
 	if [ "$success" -eq 1 ] && [ -s "$runfile" ]; then
@@ -138,9 +119,12 @@ get_data_from_host() {
 	rm -f "$runfile" "$errfile"
 }
 
-T=$(uci -q get apcontroller.@global[0].path)
-[ -n "$T" ] && BASEPATH="$T"
 mkdir -p "$BASEPATH"
+chmod 700 "$BASEPATH"
+mkdir -p "$DBCLIENT_HOME/.ssh"
+chmod 700 "$DBCLIENT_HOME" "$DBCLIENT_HOME/.ssh"
+touch "$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
 config_load apcontroller
 config_foreach get_data_from_host host
 

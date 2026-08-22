@@ -1,5 +1,28 @@
 #!/bin/sh
 
+KNOWN_HOSTS="/etc/apcontroller/.ssh/known_hosts"
+mkdir -p /etc/apcontroller/keys /etc/apcontroller/.ssh
+chmod 700 /etc/apcontroller /etc/apcontroller/keys /etc/apcontroller/.ssh
+if [ ! -s "$KNOWN_HOSTS" ]; then
+	if [ -s /etc/apcontroller/known_hosts ]; then
+		cp /etc/apcontroller/known_hosts "$KNOWN_HOSTS"
+	elif [ -s /root/.ssh/known_hosts ]; then
+		cp /root/.ssh/known_hosts "$KNOWN_HOSTS"
+	fi
+fi
+touch "$KNOWN_HOSTS"
+chmod 600 "$KNOWN_HOSTS"
+for KEY in /root/.ssh/id_apc_*; do
+	[ -f "$KEY" ] || continue
+	TARGET="/etc/apcontroller/keys/${KEY##*/}"
+	[ -f "$TARGET" ] || cp "$KEY" "$TARGET"
+	chmod 600 "$TARGET"
+	if [ -f "$KEY.pub" ] && [ ! -f "$TARGET.pub" ]; then
+		cp "$KEY.pub" "$TARGET.pub"
+		chmod 600 "$TARGET.pub"
+	fi
+done
+
 MIN=$(uci -q get apcontroller.@global[0].interval)
 touch /etc/crontabs/root
 grep -q apcontroller /etc/crontabs/root || echo "*/${MIN:-5} * * * * /usr/bin/apcontroller" >> /etc/crontabs/root

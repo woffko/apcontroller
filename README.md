@@ -7,7 +7,7 @@ The application is a lightweight Access Point (AP) management system, developed 
 <img src="https://raw.githubusercontent.com/obsy/apcontroller/refs/heads/main/img/tab-devices.png">
  
 The application provides the following features:
-- adding and defining devices (running on OpenWrt) and storing access credentials (such as IP address, port, username, and password, URL to the GUI)
+- adding and defining devices (running on OpenWrt) and storing connection details (such as IP address, port, username, and URL to the GUI)
 - enabling/disabling device monitoring and presenting device operation parameters
 - list of wireless clients connected to monitored devices with Wi-Fi
 - downloading logs from the device, the ability to reboot and ping the device, and executing user-created scripts
@@ -39,7 +39,11 @@ The system offers a simplified but centralized management solution for OpenWrt-b
 
 ## Using key-based authentication
 
-Authorization in the AP is by default performed using a username/password pair. If you are using key-based authentication, select the "Use SSH Key" option and, if necessary, specify the key file. Keys can be generated with the following command (on a router with apcontroller installed):
+AP Controller requires SSH key authentication for polling, configuration deployment, and device actions. Automatic SSH Key Setup generates a separate key for each device under `/etc/apcontroller/keys`, obtains and pins the AP host key, and uses the entered SSH password only to install and verify the generated public key. After successful verification, the bootstrap password is removed from UCI.
+
+The **Reinstall AP keys** action requires a current bootstrap password for every selected AP. Enter the passwords again in the device forms before using this action after an earlier successful setup.
+
+For a manually managed key, disable Automatic SSH Key Setup, select the "Use SSH Key" option, and specify the key file if necessary. Keys can be generated with the following command (on a router with apcontroller installed):
 ```
 mkdir /root/.ssh
 dropbearkey -f /root/.ssh/id_dropbear

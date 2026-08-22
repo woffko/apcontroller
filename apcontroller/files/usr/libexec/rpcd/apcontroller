@@ -5,14 +5,15 @@
 #
 
 BASEPATH="/tmp/apcontroller"
-T=$(uci -q get apcontroller.@global[0].path)
-[ -n "$T" ] && BASEPATH="$T"
 mkdir -p "$BASEPATH"
+chmod 700 "$BASEPATH"
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
 
 DEBUG_LOG="/tmp/apcontroller_setup.debug"
+DBCLIENT_HOME="/etc/apcontroller"
+KNOWN_HOSTS="${DBCLIENT_HOME}/.ssh/known_hosts"
 
 log_apcontroller() {
 	logger -t apcontroller "$*"
@@ -20,7 +21,64 @@ log_apcontroller() {
 }
 
 default_keyfile() {
-	echo "/root/.ssh/id_apc_$1"
+	echo "/etc/apcontroller/keys/id_apc_$1"
+}
+
+json_error() {
+	json_init
+	json_add_string "error" "$1"
+	json_dump
+}
+
+valid_section() {
+	case "$1" in
+		""|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+	[ "$(uci -q get "apcontroller.$1")" = "host" ]
+}
+
+valid_group() {
+	case "$1" in
+		""|*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+	[ "$(uci -q get "apcontroller.$1")" = "group" ]
+}
+
+valid_host() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
+}
+
+valid_username() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._-]+$'
+}
+
+valid_port() {
+	case "$1" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+valid_keyfile() {
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^(/etc/apcontroller/keys|/root/\.ssh)/[A-Za-z0-9._-]+$'
+}
+
+command_result() {
+	local rc="$1"
+	local stdout_file="$2"
+	local stderr_file="$3"
+	local stdout stderr
+
+	stdout="$(cat "$stdout_file" 2>/dev/null)"
+	stderr="$(cat "$stderr_file" 2>/dev/null)"
+	rm -f "$stdout_file" "$stderr_file"
+
+	json_init
+	json_add_int "code" "$rc"
+	[ -n "$stdout" ] && json_add_string "stdout" "$stdout"
+	[ -n "$stderr" ] && json_add_string "stderr" "$stderr"
+	[ "$rc" -eq 0 ] || json_add_string "error" "Command failed"
+	json_dump
 }
 
 normalize_keyfile() {
@@ -37,9 +95,9 @@ show_data_from_host() {
 	config_get_bool enabled "$cfg" enabled 1
 	config_get name "$cfg" name
 	config_get ipaddr "$cfg" ipaddr
+	valid_host "$ipaddr" || ipaddr=""
 	config_get port "$cfg" port 22
 	config_get username "$cfg" username
-	config_get password "$cfg" password
 	config_get_bool autokeysetup "$cfg" autokeysetup 0
 	config_get_bool usekeyfile "$cfg" usekeyfile 0
 	config_get keyfile "$cfg" keyfile "/root/.ssh/id_dropbear"
@@ -52,7 +110,7 @@ show_data_from_host() {
 		keyauth="$usekeyfile"
 	fi
 
-	authmode="password"
+	authmode="setup_required"
 	if [ "$keyauth" = "1" ]; then
 		if [ -e "$keyfile" ]; then
 			[ "$autokeysetup" = "1" ] && authmode="auto_key" || authmode="key"
@@ -76,14 +134,13 @@ show_data_from_host() {
 	json_add_string "ipaddr" "$ipaddr"
 	json_add_int "port" "$port"
 	json_add_string "username" "$username"
-	json_add_string "password" "$password"
 	json_add_boolean "autokeysetup" "$autokeysetup"
 	json_add_boolean "usekeyfile" "$usekeyfile"
 	json_add_string "keyfile" "$keyfile"
 	json_add_string "authmode" "$authmode"
 
 	LASTCONTACT=-1
-	if [ -s "${BASEPATH}/${ipaddr}-${cfg}" ] && [ "$enabled" = "1" ]; then
+	if [ -n "$ipaddr" ] && [ -s "${BASEPATH}/${ipaddr}-${cfg}" ] && [ "$enabled" = "1" ]; then
 		FILEMODTIME=$(date +%s -r $BASEPATH/${ipaddr}-${cfg})
 		NOW=$(date +%s)
 		LASTCONTACT=$((NOW - FILEMODTIME))
@@ -175,7 +232,17 @@ show_activity() {
 	read input; json_load "$input"
 	json_get_var section section
 	json_init
+	if ! valid_section "$section"; then
+		json_add_string "error" "Invalid host section"
+		json_add_array "activity"; json_close_array; json_dump
+		return
+	fi
 	ipaddr=$(uci_get "apcontroller" "$section" "ipaddr" "")
+	if ! valid_host "$ipaddr"; then
+		json_add_string "error" "Invalid host address"
+		json_add_array "activity"; json_close_array; json_dump
+		return
+	fi
 	enabled=$(uci_get "apcontroller" "$section" "enabled" "0")
 	json_add_array "activity"
 	if [ -n "$ipaddr" ] && [ -s "${BASEPATH}/${ipaddr}.txt" ] && [ "$enabled" = "1" ]; then
@@ -218,33 +285,27 @@ show_status() {
 ssh_setup() {
 	read input; json_load "$input"
 	json_get_var section section
-	json_get_var ipaddr ipaddr
-	json_get_var username username
 	json_get_var password password
-	json_get_var port port
-	json_get_var keyfile keyfile
 
 	config_load apcontroller
-	[ -z "$ipaddr" ] && config_get ipaddr "$section" ipaddr
-	[ -z "$username" ] && config_get username "$section" username
-	[ -z "$password" ] && config_get password "$section" password
-	[ -z "$port" ] && config_get port "$section" port 22
-	case "$keyfile" in
-		""|"/root/.ssh/id_dropbear")
-			keyfile="$(default_keyfile "$section")"
-			;;
-		/root/.ssh/id_apc_*)
-			[ "$keyfile" = "$(default_keyfile "$section")" ] || keyfile="$(default_keyfile "$section")"
-			;;
-	esac
+	if ! valid_section "$section"; then
+		json_error "Invalid host section"; return
+	fi
+	config_get ipaddr "$section" ipaddr
+	config_get username "$section" username root
+	config_get port "$section" port 22
+	keyfile="$(default_keyfile "$section")"
 
-	if [ -z "$ipaddr" ] || [ -z "$username" ] || [ -z "$password" ]; then
-		log_apcontroller "Aborted: Missing required info (IP=$ipaddr, User=$username, Pass=***)"
-		json_init; json_add_string "error" "Missing credentials"; json_dump; return
+	if ! valid_host "$ipaddr" || ! valid_username "$username" || ! valid_port "$port" || ! valid_keyfile "$keyfile"; then
+		json_error "Invalid SSH host configuration"; return
+	fi
+	if [ -z "$password" ]; then
+		json_error "Missing bootstrap password"; return
 	fi
 
 	log_apcontroller "--- Setup for $section ($ipaddr) ---"
 	mkdir -p "$(dirname "$keyfile")"
+	chmod 700 "$(dirname "$keyfile")"
 
 	if [ ! -f "$keyfile" ]; then
 		log_apcontroller "Generating new key: $keyfile"
@@ -258,7 +319,7 @@ ssh_setup() {
 		rm -f "$TMPKEY" "$keyfile.pub" "$KEYGEN_ERR"
 
 		if dropbearkey -t ed25519 -f "$TMPKEY" >"$KEYGEN_ERR" 2>&1 || dropbearkey -t rsa -s 3072 -f "$TMPKEY" >"$KEYGEN_ERR" 2>&1; then
-			PUBKEY=$(dropbearkey -y -f "$TMPKEY" 2>/dev/null | grep -E "^ssh-(rsa|ed25519) " | head -n 1)
+			PUBKEY=$(dropbearkey -y -f "$TMPKEY" 2>/dev/null | awk '$1 == "ssh-rsa" || $1 == "ssh-ed25519" { print $1 " " $2; exit }')
 			if [ -z "$PUBKEY" ]; then
 				rm -f "$TMPKEY" "$KEYGEN_ERR"
 				log_apcontroller "Failed to extract public key from generated dropbear key"
@@ -280,35 +341,51 @@ ssh_setup() {
 	fi
 
 	PUBKEY=""
-	[ -f "$keyfile.pub" ] && PUBKEY=$(grep -E "^ssh-(rsa|ed25519) " "$keyfile.pub" | head -n 1)
+	[ -f "$keyfile.pub" ] && PUBKEY=$(awk '$1 == "ssh-rsa" || $1 == "ssh-ed25519" { print $1 " " $2; exit }' "$keyfile.pub")
 	if [ -z "$PUBKEY" ] && [ -x /usr/libexec/ssh-keygen-openssh ]; then
-		PUBKEY=$(/usr/libexec/ssh-keygen-openssh -y -f "$keyfile" 2>/dev/null | grep -E "^ssh-(rsa|ed25519) " | head -n 1)
+		PUBKEY=$(/usr/libexec/ssh-keygen-openssh -y -f "$keyfile" 2>/dev/null | awk '$1 == "ssh-rsa" || $1 == "ssh-ed25519" { print $1 " " $2; exit }')
 	fi
 	if [ -z "$PUBKEY" ]; then
-		PUBKEY=$(dropbearkey -y -f "$keyfile" 2>/dev/null | grep -E "^ssh-(rsa|ed25519) " | head -n 1)
+		PUBKEY=$(dropbearkey -y -f "$keyfile" 2>/dev/null | awk '$1 == "ssh-rsa" || $1 == "ssh-ed25519" { print $1 " " $2; exit }')
 	fi
 
-	if [ -z "$PUBKEY" ]; then
+	if [ -z "$PUBKEY" ] || ! printf '%s\n' "$PUBKEY" | grep -Eq '^ssh-(rsa|ed25519) [A-Za-z0-9+/=]+$'; then
 		log_apcontroller "Failed to extract public key from $keyfile"
 		json_init; json_add_string "error" "Pubkey extraction failed"; json_dump; return
 	fi
 
-	mkdir -p /root/.ssh; touch /root/.ssh/known_hosts
-	sed -i "/^$ipaddr /d" /root/.ssh/known_hosts
-	ssh-keyscan -p "$port" "$ipaddr" >> /root/.ssh/known_hosts 2>/dev/null
+	local hostkey_target scan_file known_hosts_new
 
-	PASS_SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
-	KEY_SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/.ssh/known_hosts -o ConnectTimeout=10 -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
-	DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=accept-new -p ${port} -l ${username}"
+	mkdir -p "$DBCLIENT_HOME/.ssh"
+	chmod 700 "$DBCLIENT_HOME" "$DBCLIENT_HOME/.ssh"
+	touch "$KNOWN_HOSTS"
+	chmod 600 "$KNOWN_HOSTS"
+	hostkey_target="$ipaddr"
+	[ "$port" = "22" ] || hostkey_target="[$ipaddr]:$port"
+	scan_file="${BASEPATH}/keyscan-${section}.$$"
+	known_hosts_new="${BASEPATH}/known-hosts-${section}.$$"
+	if ! ssh-keyscan -p "$port" "$ipaddr" 2>/dev/null | awk 'NF >= 3 && $1 !~ /^#/' > "$scan_file" || [ ! -s "$scan_file" ]; then
+		rm -f "$scan_file" "$known_hosts_new"
+		json_error "Unable to obtain SSH host key"; return
+	fi
+	awk -v target="$hostkey_target" '$1 != target' "$KNOWN_HOSTS" > "$known_hosts_new"
+	cat "$scan_file" >> "$known_hosts_new"
+	chmod 600 "$known_hosts_new"
+	mv -f "$known_hosts_new" "$KNOWN_HOSTS"
+	rm -f "$scan_file"
+
+	PASS_SSH_OPTS="-o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o ConnectTimeout=10 -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+	KEY_SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS} -o ConnectTimeout=10 -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa"
+	DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=yes -p ${port} -l ${username}"
 
 	log_apcontroller "Pushing pubkey to AP..."
-	sshpass -p "$password" ssh $PASS_SSH_OPTS -p "$port" "${username}@$ipaddr" \
+	printf '%s\n' "$password" | sshpass -d 0 ssh $PASS_SSH_OPTS -p "$port" "${username}@$ipaddr" \
 		"umask 077; mkdir -p /etc/dropbear && touch /etc/dropbear/authorized_keys && chmod 600 /etc/dropbear/authorized_keys && { grep -qF '$PUBKEY' /etc/dropbear/authorized_keys || printf '%s\n' '$PUBKEY' >> /etc/dropbear/authorized_keys; }" >/dev/null 2>&1
 
 	if [ $? -eq 0 ]; then
 		log_apcontroller "Verifying login with key..."
 		if command -v dbclient >/dev/null 2>&1 && dropbearkey -y -f "$keyfile" >/dev/null 2>&1; then
-			dbclient $DBCLIENT_OPTS "$ipaddr" "true" >/dev/null 2>&1
+			HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "true" >/dev/null 2>&1
 			VERIFY_RC=$?
 		else
 			ssh -q -i "$keyfile" $KEY_SSH_OPTS -o PreferredAuthentications=publickey -p "$port" "${username}@$ipaddr" "true" >/dev/null 2>&1
@@ -318,6 +395,7 @@ ssh_setup() {
 		if [ "$VERIFY_RC" -eq 0 ]; then
 			uci set apcontroller."$section".autokeysetup='1'
 			uci set apcontroller."$section".keyfile="$keyfile"
+			uci -q delete apcontroller."$section".password
 			uci commit apcontroller
 			log_apcontroller "SUCCESS"
 			json_init; json_add_string "result" "success"; json_dump
@@ -331,24 +409,158 @@ ssh_setup() {
 	fi
 }
 
+sync_cron() {
+	local interval tmp
+
+	interval="$(uci -q get apcontroller.@global[0].interval)"
+	case "$interval" in
+		""|*[!0-9]*) json_error "Invalid polling interval"; return ;;
+	esac
+	if [ "$interval" -lt 1 ] || [ "$interval" -gt 59 ]; then
+		json_error "Polling interval must be between 1 and 59 minutes"; return
+	fi
+
+	tmp="/etc/crontabs/.apcontroller.$$"
+	mkdir -p /etc/crontabs
+	touch /etc/crontabs/root
+	chmod 600 /etc/crontabs/root
+	sed '/^\*\/[0-9][0-9]* \* \* \* \* \/usr\/bin\/apcontroller$/d' /etc/crontabs/root > "$tmp" || {
+		rm -f "$tmp"; json_error "Unable to read root crontab"; return;
+	}
+	printf '*/%s * * * * /usr/bin/apcontroller\n' "$interval" >> "$tmp"
+	chmod 600 "$tmp"
+	mv -f "$tmp" /etc/crontabs/root
+	/etc/init.d/cron reload >/dev/null 2>&1 || {
+		json_error "Unable to reload cron"; return;
+	}
+	json_init; json_add_string "result" "success"; json_dump
+}
+
+run_controller() {
+	local stdout_file="${BASEPATH}/controller.$$.out"
+	local stderr_file="${BASEPATH}/controller.$$.err"
+	local rc
+
+	/usr/bin/apcontroller >"$stdout_file" 2>"$stderr_file"
+	rc=$?
+	command_result "$rc" "$stdout_file" "$stderr_file"
+}
+
+ping_host() {
+	local input section ipaddr stdout_file stderr_file rc
+
+	read input; json_load "$input"
+	json_get_var section section
+	if ! valid_section "$section"; then
+		json_error "Invalid host section"; return
+	fi
+	ipaddr="$(uci -q get "apcontroller.$section.ipaddr")"
+	if ! valid_host "$ipaddr"; then
+		json_error "Invalid host address"; return
+	fi
+	stdout_file="${BASEPATH}/ping-${section}.$$.out"
+	stderr_file="${BASEPATH}/ping-${section}.$$.err"
+	ping -4 -c 5 -W 1 "$ipaddr" >"$stdout_file" 2>"$stderr_file"
+	rc=$?
+	command_result "$rc" "$stdout_file" "$stderr_file"
+}
+
+send_config() {
+	local input section stdout_file stderr_file rc
+
+	read input; json_load "$input"
+	json_get_var section section
+	if ! valid_group "$section"; then
+		json_error "Invalid group section"; return
+	fi
+	stdout_file="${BASEPATH}/send-${section}.$$.out"
+	stderr_file="${BASEPATH}/send-${section}.$$.err"
+	/usr/bin/apcontroller-sendconfig "$section" verbose >"$stdout_file" 2>"$stderr_file"
+	rc=$?
+	command_result "$rc" "$stdout_file" "$stderr_file"
+}
+
+run_script() {
+	local input section script ipaddr username port autokeysetup usekeyfile keyfile
+	local script_path stdout_file stderr_file rc
+
+	read input; json_load "$input"
+	json_get_var section section
+	json_get_var script script
+	if ! valid_section "$section"; then
+		json_error "Invalid host section"; return
+	fi
+	case "$script" in
+		""|*[!A-Za-z0-9._-]*) json_error "Invalid script name"; return ;;
+	esac
+	script_path="/usr/share/apcontroller/scripts/$script"
+	if [ ! -f "$script_path" ] || [ -L "$script_path" ]; then
+		json_error "Script not found"; return
+	fi
+
+	config_load apcontroller
+	config_get ipaddr "$section" ipaddr
+	config_get username "$section" username root
+	config_get port "$section" port 22
+	config_get_bool autokeysetup "$section" autokeysetup 0
+	config_get_bool usekeyfile "$section" usekeyfile 0
+	config_get keyfile "$section" keyfile "/root/.ssh/id_dropbear"
+	if [ "$autokeysetup" = "1" ]; then
+		keyfile="$(default_keyfile "$section")"
+	elif [ "$usekeyfile" != "1" ]; then
+		json_error "SSH key authentication is required"; return
+	fi
+
+	if ! valid_host "$ipaddr" || ! valid_username "$username" || ! valid_port "$port" || ! valid_keyfile "$keyfile"; then
+		json_error "Invalid SSH host configuration"; return
+	fi
+	if [ ! -f "$keyfile" ] || [ ! -f "$KNOWN_HOSTS" ]; then
+		json_error "SSH key setup is required"; return
+	fi
+
+	stdout_file="${BASEPATH}/script-${section}.$$.out"
+	stderr_file="${BASEPATH}/script-${section}.$$.err"
+	scp -q -i "$keyfile" -o BatchMode=yes -o PasswordAuthentication=no \
+		-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+		-P "$port" "$script_path" "${username}@${ipaddr}:/tmp/$script" \
+		>/dev/null 2>"$stderr_file"
+	rc=$?
+	if [ "$rc" -eq 0 ]; then
+		ssh -q -i "$keyfile" -o BatchMode=yes -o PasswordAuthentication=no \
+			-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
+			-p "$port" "${username}@${ipaddr}" sh "/tmp/$script" \
+			>"$stdout_file" 2>"$stderr_file"
+		rc=$?
+	else
+		: > "$stdout_file"
+	fi
+	command_result "$rc" "$stdout_file" "$stderr_file"
+}
+
 case "$1" in
 	list)
 		json_init
 		json_add_object "activity"; json_add_string "section" ""; json_close_object
+		json_add_object "cron_sync"; json_close_object
+		json_add_object "ping"; json_add_string "section" ""; json_close_object
+		json_add_object "refresh"; json_close_object
+		json_add_object "run_script"; json_add_string "section" ""; json_add_string "script" ""; json_close_object
+		json_add_object "send_config"; json_add_string "section" ""; json_close_object
 		json_add_object "scripts"; json_close_object
 		json_add_object "status"; json_close_object
 		json_add_object "ssh_setup"
 		json_add_string "section" ""
-		json_add_string "ipaddr" ""
-		json_add_string "username" ""
 		json_add_string "password" ""
-		json_add_string "port" ""
-		json_add_string "keyfile" ""
 		json_close_object
 		json_dump ;;
 	call)
 		case "$2" in
 			activity) show_activity ;;
+			cron_sync) sync_cron ;;
+			ping) ping_host ;;
+			refresh) run_controller ;;
+			run_script) run_script ;;
+			send_config) send_config ;;
 			scripts) show_scripts ;;
 			status) show_status ;;
 			ssh_setup) ssh_setup ;;

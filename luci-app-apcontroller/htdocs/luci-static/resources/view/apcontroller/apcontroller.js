@@ -8,13 +8,15 @@
 'require ui';
 'require view';
 
-let callHostHints, callAPControllerActivity, callAPControllerScripts, callAPController, callAPControllerSSHSetup;
+let callHostHints, callAPControllerActivity, callAPControllerScripts, callAPController,
+	callAPControllerCronSync, callAPControllerPing, callAPControllerRefresh,
+	callAPControllerRunScript, callAPControllerSendConfig, callAPControllerSSHSetup;
 const additionalScriptFile = '/usr/share/apcontroller/apcontroller.user';
 let additionalScript = '';
 let pendingSSHSetupSections = [];
 
 function defaultKeyfile(section_id) {
-	return '/root/.ssh/id_apc_' + section_id;
+	return '/etc/apcontroller/keys/id_apc_' + section_id;
 }
 
 function defaultManualKeyfile() {
@@ -117,7 +119,40 @@ callAPController = rpc.declare({
 callAPControllerSSHSetup = rpc.declare({
 	object: 'apcontroller',
 	method: 'ssh_setup',
-	params: [ 'section', 'ipaddr', 'username', 'password', 'port', 'keyfile' ],
+	params: [ 'section', 'password' ],
+	expect: { '': {} }
+});
+
+callAPControllerCronSync = rpc.declare({
+	object: 'apcontroller',
+	method: 'cron_sync',
+	expect: { '': {} }
+});
+
+callAPControllerPing = rpc.declare({
+	object: 'apcontroller',
+	method: 'ping',
+	params: [ 'section' ],
+	expect: { '': {} }
+});
+
+callAPControllerRefresh = rpc.declare({
+	object: 'apcontroller',
+	method: 'refresh',
+	expect: { '': {} }
+});
+
+callAPControllerRunScript = rpc.declare({
+	object: 'apcontroller',
+	method: 'run_script',
+	params: [ 'section', 'script' ],
+	expect: { '': {} }
+});
+
+callAPControllerSendConfig = rpc.declare({
+	object: 'apcontroller',
+	method: 'send_config',
+	params: [ 'section' ],
 	expect: { '': {} }
 });
 
@@ -191,7 +226,7 @@ function hostAuthMode(records, section_id) {
 	if (obj.authmode === 'key_missing')
 		return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('SSH key missing'));
 
-	return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('SSH password'));
+	return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('SSH key setup required'));
 }
 
 function hostInfo(key, records, section_id) {
@@ -222,16 +257,13 @@ return view.extend({
 
 		setupSections.forEach(section_id => {
 			let ipaddr = map.data.get('apcontroller', section_id, 'ipaddr');
-			let username = map.data.get('apcontroller', section_id, 'username') || 'root';
 			let password = map.data.get('apcontroller', section_id, 'password');
-			let port = map.data.get('apcontroller', section_id, 'port') || '22';
-			let keyfile = defaultKeyfile(section_id);
 
 			if (password && ipaddr) {
 				setupPromises.push({
 					id: section_id,
 					name: map.data.get('apcontroller', section_id, 'name') || section_id,
-					fn: () => callAPControllerSSHSetup(section_id, ipaddr, username, password, port, keyfile)
+					fn: () => callAPControllerSSHSetup(section_id, password)
 				});
 			} else {
 				ui.addNotification(null, E('p', _('SSH setup for %s skipped: missing host address or password').format(map.data.get('apcontroller', section_id, 'name') || section_id)), 'warning');
@@ -245,15 +277,18 @@ return view.extend({
 			E('p', { 'class': 'spinning' }, [ _('Pairing with %d devices... (SSH password used once)').format(setupPromises.length) ])
 		]);
 
-		return Promise.all(setupPromises.map(p => {
-			return p.fn().then(res => {
+		let sequence = Promise.resolve();
+		setupPromises.forEach(p => {
+			sequence = sequence.then(() => p.fn()).then(res => {
 				if (res.result === 'success') {
 					ui.addNotification(null, E('p', _('SSH setup for %s success!').format(p.name)), 'info');
 				} else {
 					ui.addNotification(null, E('p', _('SSH setup for %s failed: %s').format(p.name, res.error || 'Unknown error')), 'error');
 				}
 			});
-		})).then(() => {
+		});
+
+		return sequence.then(() => {
 			ui.hideModal();
 			return uci.unload('apcontroller').then(() => uci.load('apcontroller'));
 		}).then(() => {
@@ -300,33 +335,10 @@ return view.extend({
 
 		return this.super('handleSaveApply', [ev, mode]).then(() => {
 			let runSetup = this.runSSHSetups([], true);
-
-			const container = document.querySelector('.cbi-value[data-name="interval"]');
-			const intervalInput = container ? container.querySelector('input') : null;
-			const interval = intervalInput ? intervalInput.value : null;
-
-			let cronTask = Promise.resolve();
-			if (interval) {
-				cronTask = fs.read('/etc/crontabs/root').then((data) => {
-					let crontabsroot = data || '';
-					const regLine = /^(\*\/\d+ \* \* \* \* \/usr\/bin\/apcontroller)$/m;
-					const wanted = `*/${interval} * * * * /usr/bin/apcontroller`;
-
-					let needUpdate = false;
-					if (!regLine.test(crontabsroot)) {
-						if (!crontabsroot.endsWith('\n')) crontabsroot += '\n';
-						crontabsroot += wanted + '\n';
-						needUpdate = true;
-					} else if (!crontabsroot.includes(wanted)) {
-						crontabsroot = crontabsroot.replace(regLine, wanted);
-						needUpdate = true;
-					}
-
-					if (needUpdate) {
-						return fs.write('/etc/crontabs/root', crontabsroot).then(() => fs.exec('/etc/init.d/cron', ['reload']));
-					}
-				});
-			}
+			let cronTask = callAPControllerCronSync().then(res => {
+				if (res.error)
+					throw new Error(res.error);
+			});
 
 			return Promise.all([runSetup, cronTask]).then(() => {
 				return;
@@ -902,12 +914,12 @@ return view.extend({
 		};
 
 		s.actionPing = function(section_id) {
-			const row = this.cfgvalue(section_id);
-
 			ui.showModal(_('Ping'), [
 				E('p', { 'class': 'spinning' }, [ _('Pinging device...') ])
 			]);
-			return fs.exec('ping', [ '-4', '-c', '5', '-W', '1', row['ipaddr'] ]).then(function(res) {
+			return callAPControllerPing(section_id).then(function(res) {
+				if (res.error)
+					throw new Error(res.stderr || res.error);
 				ui.showModal(_('Ping'), [
 					res.stdout ? E('textarea', {
 						'spellcheck': 'false',
@@ -935,8 +947,6 @@ return view.extend({
 		};
 
 		s.actionExec = function(section_id) {
-			const row = this.cfgvalue(section_id);
-
 			return callAPControllerScripts().then(function(res) {
 				res.scripts.sort((a, b) => a.file.localeCompare(b.file));
 				let options = [];
@@ -961,64 +971,13 @@ return view.extend({
 										if (!confirm(_('Are you sure you want to execute the "%s" script?').format(description)))
 											return;
 									}
-									let cmd = '';
-									let args = [];
-									const actionKeyfile = flagEnabled(row['autokeysetup']) ? defaultKeyfile(section_id) : (row['keyfile'] || defaultManualKeyfile());
-									const actionUseKey = flagEnabled(row['autokeysetup']) || (row['usekeyfile'] && actionKeyfile);
-									if (actionUseKey && actionKeyfile) {
-											cmd = 'scp';
-											args = [
-												'-i', actionKeyfile,
-												'-o', 'StrictHostKeyChecking=no',
-												'-P', row['port'],
-												'/usr/share/apcontroller/scripts/' + script,
-												row['username'] + '@' + row['ipaddr'] + ':/tmp'
-											];
-									} else {
-											cmd = 'sshpass';
-											args = [
-												'-p', typeof row['password'] !== 'undefined' ? row['password']: '""',
-												'scp',
-												'-o', 'StrictHostKeyChecking=no',
-												'-P', row['port'],
-												'/usr/share/apcontroller/scripts/' + script,
-												row['username'] + '@' + row['ipaddr'] + ':/tmp'
-											];
-									}
-									return fs.exec(cmd, args).then(function(res) {
-										if (actionUseKey && actionKeyfile) {
-											cmd = 'ssh';
-											args = [
-												'-q',
-												'-i', actionKeyfile,
-												'-o', 'StrictHostKeyChecking=no',
-												'-p', row['port'],
-												row['username'] + '@' + row['ipaddr'],
-												'sh',
-												'/tmp/' + script
-											];
-										} else {
-											cmd = 'sshpass';
-											args = [
-												'-p', typeof row['password'] !== 'undefined' ? row['password']: '""',
-												'ssh',
-												'-q',
-												'-o', 'StrictHostKeyChecking=no',
-												'-p', row['port'],
-												row['username'] + '@' + row['ipaddr'],
-												'sh',
-												'/tmp/' + script
-											];
-										}
-										return fs.exec(cmd, args).then(function(res) {
-											if (res.stdout) document.querySelector('#actionexecstdout').value = res.stdout;
-											if (res.stderr) {
-												res.stderr = res.stderr.replace(/^.*Caution, skipping hostkey check for [\d\.]+\n\n/, "");
-												if (res.stderr) document.querySelector('#actionexecstderr').value = res.stderr;
-											}
-										}).catch(function(err) {
-											document.querySelector('#actionexecstderr').value = err;
-										});
+									return callAPControllerRunScript(section_id, script).then(function(res) {
+										if (res.stdout)
+											document.querySelector('#actionexecstdout').value = res.stdout;
+										if (res.stderr)
+											document.querySelector('#actionexecstderr').value = res.stderr;
+										if (res.error)
+											throw new Error(res.stderr || res.error);
 									}).catch(function(err) {
 										document.querySelector('#actionexecstderr').value = err;
 									});
@@ -1110,6 +1069,7 @@ return view.extend({
 		o.modalonly = true;
 		o.password = true;
 		o.retain = true;
+		o.depends('autokeysetup', '1');
 		o.renderWidget = function(section_id) {
 			const widget = form.Value.prototype.renderWidget.apply(this, arguments);
 			const input = widget && widget.querySelector ? widget.querySelector('input') : null;
@@ -1126,7 +1086,7 @@ return view.extend({
 		o = s.taboption('host', form.Flag, 'autokeysetup', _('Automatic SSH Key Setup'), _('Requires the correct SSH password when setup is enabled. On save, the password is used once to install a generated per-device key, then future connections use that key.'));
 		o.modalonly = true;
 		o.rmempty = false;
-		o.default = 0;
+		o.default = 1;
 		o.write = function(section_id, value) {
 			const oldValue = this.cfgvalue(section_id);
 			const ret = form.Flag.prototype.write.apply(this, arguments);
@@ -1431,7 +1391,9 @@ return view.extend({
 				ui.showModal(_('Sending commands'), [
 					E('p', { 'class': 'spinning' }, [ _('Sending commands to devices...') ])
 				]);
-				return fs.exec('/usr/bin/apcontroller-sendconfig', [ section_id, 'verbose' ]).then(function(res) {
+				return callAPControllerSendConfig(section_id).then(function(res) {
+					if (res.error)
+						throw new Error(res.stderr || res.error);
 					ui.showModal(_('Sending commands'), [
 						res.stdout ? E('pre', [ res.stdout ]) : '',
 						res.stderr ? E('pre', [ res.stderr ]) : '',
@@ -1532,9 +1494,11 @@ return view.extend({
 
 		o = s.option(form.Value, 'path', _('Data directory'), _('Data storage directory'))
 		o.rmempty = false;
+		o.default = '/tmp/apcontroller';
+		o.readonly = true;
 
 		o = s.option(form.Value, 'interval', _('Device Reading Interval'), _('[minutes] The period in which devices will be periodically polled'));
-		o.datatype = 'and(uinteger,min(1),max(9999))';
+		o.datatype = 'and(uinteger,min(1),max(59))';
 
 		o = s.option(form.MultiValue, 'column', _('Devices List Columns'), _('List of columns to display in the devices list'));
 		o.value('enabled', _('Enabled'));
@@ -1610,7 +1574,9 @@ return view.extend({
 				]);
 
 				try {
-					await fs.exec('/usr/bin/apcontroller');
+					const result = await callAPControllerRefresh();
+					if (result.error)
+						throw new Error(result.stderr || result.error);
 					window.location.reload();
 				} catch (e) {
 					ui.hideModal();
