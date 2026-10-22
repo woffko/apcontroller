@@ -111,7 +111,9 @@ while json_is_a $IDX object; do
 		continue
 	fi
 
-	SECTIONS=$(uci -q show wireless | awk -F. '/\.ssid='\'''"$ssid"''\''$/{print $2}')
+	# The SSID is data from the controller: pass it as an awk variable so no
+	# character in it can become awk program text.
+	SECTIONS=$(uci -q show wireless | awk -F. -v ssid="$ssid" -v q="'" '{ needle = ".ssid=" q ssid q; if (length($0) >= length(needle) && substr($0, length($0) - length(needle) + 1) == needle) print $2 }')
 	if [ -z "$SECTIONS" ]; then
 		for RADIO in $RADIOS; do
 			wifi_add "$RADIO" "$network" "$enabled" "$ssid" "$encryption" "$key" "$hidden" "$isolate"

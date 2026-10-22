@@ -12,6 +12,9 @@ VERBOSE=$2
 . /usr/share/libubox/jshn.sh
 
 BASEPATH="/tmp/apcontroller"
+# Command files carry Wi-Fi passphrases: root-only here, and scp carries the
+# mode over, so they land root-only on the access point as well.
+umask 077
 DBCLIENT_HOME="/etc/apcontroller"
 KNOWN_HOSTS="${DBCLIENT_HOME}/.ssh/known_hosts"
 mkdir -p "$BASEPATH"
@@ -36,11 +39,11 @@ normalize_keyfile() {
 }
 
 valid_host() {
-	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
 }
 
 valid_username() {
-	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._-]+$'
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]*$'
 }
 
 valid_port() {
@@ -139,18 +142,18 @@ for HOST in $HOSTS; do
 					T=0
 				fi
 				[ "$T" -eq 0 ] && \
-				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/cmds-${SEC}" < ${BASEPATH}/cmds-${SEC} 2>>"$ERRFILE" && \
+				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "umask 077; cat > /tmp/cmds-${SEC}" < ${BASEPATH}/cmds-${SEC} 2>>"$ERRFILE" && \
 				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "cat > /tmp/apcontroller-agent-setconfig && chmod 755 /tmp/apcontroller-agent-setconfig" < /usr/share/apcontroller/apcontroller-agent-setconfig 2>>"$ERRFILE" && \
 				HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "/tmp/apcontroller-agent-setconfig /tmp/cmds-${SEC}" 2>>"$ERRFILE"
 				T=$?
 			else
 				if [ "x$USEAS" = "x1" ]; then
-					scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} /usr/share/apcontroller/apcontroller.user "${username}@${ipaddr}:/tmp" 2>"$ERRFILE"
-					scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} /usr/share/apcontroller/apcontroller-agent-as "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE"
+					scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} -- /usr/share/apcontroller/apcontroller.user "${username}@${ipaddr}:/tmp" 2>"$ERRFILE"
+					scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} -- /usr/share/apcontroller/apcontroller-agent-as "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE"
 				fi
-				scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} ${BASEPATH}/cmds-${SEC} "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE" && \
-				scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} /usr/share/apcontroller/apcontroller-agent-setconfig "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE" && \
-				ssh -q -i "${keyfile}" $SSH_OPTS -o PreferredAuthentications=publickey -p ${port} "${username}@${ipaddr}" "/tmp/apcontroller-agent-setconfig /tmp/cmds-${SEC}" 2>>"$ERRFILE"
+				scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} -- ${BASEPATH}/cmds-${SEC} "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE" && \
+				scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P ${port} -- /usr/share/apcontroller/apcontroller-agent-setconfig "${username}@${ipaddr}:/tmp" 2>>"$ERRFILE" && \
+				ssh -q -i "${keyfile}" $SSH_OPTS -o PreferredAuthentications=publickey -p ${port} -- "${username}@${ipaddr}" "/tmp/apcontroller-agent-setconfig /tmp/cmds-${SEC}" 2>>"$ERRFILE"
 				T=$?
 			fi
 		else

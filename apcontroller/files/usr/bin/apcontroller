@@ -25,11 +25,11 @@ normalize_keyfile() {
 }
 
 valid_host() {
-	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
 }
 
 valid_username() {
-	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._-]+$'
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]*$'
 }
 
 valid_port() {
@@ -95,8 +95,8 @@ get_data_from_host() {
 					log_apcontroller "Host '$cfg' (${ipaddr}) dropbear key auth failed: $(tr '\n' ' ' < "$errfile")"
 				fi
 			else
-				if scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P "${port}" /usr/share/apcontroller/apcontroller-agent "${username}@${ipaddr}:/tmp" 2>"$errfile" && \
-				   ssh -q -i "${keyfile}" $SSH_OPTS -o PreferredAuthentications=publickey -p "${port}" "${username}@${ipaddr}" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
+				if scp $SCP_OPTS -i "${keyfile}" $SSH_OPTS -P "${port}" -- /usr/share/apcontroller/apcontroller-agent "${username}@${ipaddr}:/tmp" 2>"$errfile" && \
+				   ssh -q -i "${keyfile}" $SSH_OPTS -o PreferredAuthentications=publickey -p "${port}" -- "${username}@${ipaddr}" "/tmp/apcontroller-agent" >"$runfile" 2>>"$errfile"; then
 					success=1
 				else
 					log_apcontroller "Host '$cfg' (${ipaddr}) key auth failed: $(tr '\n' ' ' < "$errfile")"

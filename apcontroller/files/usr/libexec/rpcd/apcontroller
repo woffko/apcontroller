@@ -5,13 +5,15 @@
 #
 
 BASEPATH="/tmp/apcontroller"
-mkdir -p "$BASEPATH"
+# Staging files (host keys, client lists, debug log) are root-only.
+umask 077
+mkdir -p "$BASEPATH" && chmod 0700 "$BASEPATH"
 chmod 700 "$BASEPATH"
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
 
-DEBUG_LOG="/tmp/apcontroller_setup.debug"
+DEBUG_LOG="${BASEPATH}/setup.debug"
 DBCLIENT_HOME="/etc/apcontroller"
 KNOWN_HOSTS="${DBCLIENT_HOME}/.ssh/known_hosts"
 
@@ -45,11 +47,11 @@ valid_group() {
 }
 
 valid_host() {
-	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._:-]*$'
 }
 
 valid_username() {
-	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9._-]+$'
+	[ -n "$1" ] && printf '%s\n' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]*$'
 }
 
 valid_port() {
@@ -212,7 +214,7 @@ show_data_from_host() {
 		sshstatus="ok"
 	else
 		sshstatus="failed"
-		if ping -4 -c 1 -W 1 "$ipaddr" >/dev/null 2>&1; then
+		if ping -4 -c 1 -W 1 -- "$ipaddr" >/dev/null 2>&1; then
 			status="ssh_failed"
 			pingstatus="ok"
 		else
@@ -286,6 +288,7 @@ ssh_setup() {
 	read input; json_load "$input"
 	json_get_var section section
 	json_get_var password password
+	json_get_var rotate rotate
 
 	config_load apcontroller
 	if ! valid_section "$section"; then
@@ -364,9 +367,29 @@ ssh_setup() {
 	[ "$port" = "22" ] || hostkey_target="[$ipaddr]:$port"
 	scan_file="${BASEPATH}/keyscan-${section}.$$"
 	known_hosts_new="${BASEPATH}/known-hosts-${section}.$$"
-	if ! ssh-keyscan -p "$port" "$ipaddr" 2>/dev/null | awk 'NF >= 3 && $1 !~ /^#/' > "$scan_file" || [ ! -s "$scan_file" ]; then
+	if ! ssh-keyscan -p "$port" -- "$ipaddr" 2>/dev/null | awk 'NF >= 3 && $1 !~ /^#/' > "$scan_file" || [ ! -s "$scan_file" ]; then
 		rm -f "$scan_file" "$known_hosts_new"
 		json_error "Unable to obtain SSH host key"; return
+	fi
+	# A host key already pinned for this AP is kept: a different key on the
+	# wire means another machine answers on that address. Only an explicit
+	# rotate=1 request replaces it.
+	if awk -v target="$hostkey_target" '$1 == target { found = 1 } END { exit !found }' "$KNOWN_HOSTS"; then
+		local pinned_match=0 _h _t _k _rest
+		while read -r _h _t _k _rest; do
+			[ -n "$_t" ] && [ -n "$_k" ] || continue
+			if awk -v target="$hostkey_target" -v t="$_t" -v k="$_k" '$1 == target && $2 == t && $3 == k { found = 1 } END { exit !found }' "$KNOWN_HOSTS"; then
+				pinned_match=1
+				break
+			fi
+		done < "$scan_file"
+		if [ "$pinned_match" != "1" ]; then
+			if [ "$rotate" != "1" ]; then
+				rm -f "$scan_file" "$known_hosts_new"
+				json_error "SSH host key of $ipaddr changed; pass rotate=1 to accept the new key"; return
+			fi
+			log_apcontroller "Rotating pinned SSH host key for $ipaddr"
+		fi
 	fi
 	awk -v target="$hostkey_target" '$1 != target' "$KNOWN_HOSTS" > "$known_hosts_new"
 	cat "$scan_file" >> "$known_hosts_new"
@@ -379,7 +402,7 @@ ssh_setup() {
 	DBCLIENT_OPTS="-q -i ${keyfile} -o BatchMode=yes -o PasswordAuthentication=no -o StrictHostKeyChecking=yes -p ${port} -l ${username}"
 
 	log_apcontroller "Pushing pubkey to AP..."
-	printf '%s\n' "$password" | sshpass -d 0 ssh $PASS_SSH_OPTS -p "$port" "${username}@$ipaddr" \
+	printf '%s\n' "$password" | sshpass -d 0 ssh $PASS_SSH_OPTS -p "$port" -- "${username}@$ipaddr" \
 		"umask 077; mkdir -p /etc/dropbear && touch /etc/dropbear/authorized_keys && chmod 600 /etc/dropbear/authorized_keys && { grep -qF '$PUBKEY' /etc/dropbear/authorized_keys || printf '%s\n' '$PUBKEY' >> /etc/dropbear/authorized_keys; }" >/dev/null 2>&1
 
 	if [ $? -eq 0 ]; then
@@ -388,7 +411,7 @@ ssh_setup() {
 			HOME="$DBCLIENT_HOME" dbclient $DBCLIENT_OPTS "$ipaddr" "true" >/dev/null 2>&1
 			VERIFY_RC=$?
 		else
-			ssh -q -i "$keyfile" $KEY_SSH_OPTS -o PreferredAuthentications=publickey -p "$port" "${username}@$ipaddr" "true" >/dev/null 2>&1
+			ssh -q -i "$keyfile" $KEY_SSH_OPTS -o PreferredAuthentications=publickey -p "$port" -- "${username}@$ipaddr" "true" >/dev/null 2>&1
 			VERIFY_RC=$?
 		fi
 
@@ -460,7 +483,7 @@ ping_host() {
 	fi
 	stdout_file="${BASEPATH}/ping-${section}.$$.out"
 	stderr_file="${BASEPATH}/ping-${section}.$$.err"
-	ping -4 -c 5 -W 1 "$ipaddr" >"$stdout_file" 2>"$stderr_file"
+	ping -4 -c 5 -W 1 -- "$ipaddr" >"$stdout_file" 2>"$stderr_file"
 	rc=$?
 	command_result "$rc" "$stdout_file" "$stderr_file"
 }
@@ -522,13 +545,13 @@ run_script() {
 	stderr_file="${BASEPATH}/script-${section}.$$.err"
 	scp -q -i "$keyfile" -o BatchMode=yes -o PasswordAuthentication=no \
 		-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
-		-P "$port" "$script_path" "${username}@${ipaddr}:/tmp/$script" \
+		-P "$port" -- "$script_path" "${username}@${ipaddr}:/tmp/$script" \
 		>/dev/null 2>"$stderr_file"
 	rc=$?
 	if [ "$rc" -eq 0 ]; then
 		ssh -q -i "$keyfile" -o BatchMode=yes -o PasswordAuthentication=no \
 			-o StrictHostKeyChecking=yes -o UserKnownHostsFile="$KNOWN_HOSTS" \
-			-p "$port" "${username}@${ipaddr}" sh "/tmp/$script" \
+			-p "$port" -- "${username}@${ipaddr}" sh "/tmp/$script" \
 			>"$stdout_file" 2>"$stderr_file"
 		rc=$?
 	else
