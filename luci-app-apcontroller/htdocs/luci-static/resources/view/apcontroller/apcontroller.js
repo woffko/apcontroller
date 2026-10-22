@@ -229,10 +229,20 @@ function hostAuthMode(records, section_id) {
 	return E('span', { 'style': 'display:inline-block;padding:1px 6px;border-radius:999px;background:#ffebee;color:#b71c1c;font-size:11px;font-weight:600;' }, _('SSH key setup required'));
 }
 
+// A string handed to E() or to a table cell is parsed as HTML. Values that
+// came from a managed access point or from a DHCP client are rendered as text.
+function textNode(value) {
+	return document.createTextNode(String(value ?? '-'));
+}
+
+function textChildren(value) {
+	return L.dom.elem(value) ? value : [ String(value ?? '-') ];
+}
+
 function hostInfo(key, records, section_id) {
 	const obj = records.find(item => item && item.section === section_id);
 	const data = obj ? (obj[key] ? obj[key] : '-') : '-';
-	return E('span', data);
+	return E('span', textChildren(data));
 }
 
 return view.extend({
@@ -466,7 +476,7 @@ return view.extend({
 				}
 				if (c.ipaddr == '') {
 					if (hosts[mac] && hosts[mac].ipaddrs)
-						c.ipaddr = (hosts[mac].ipaddrs).join('<br>');
+						c.ipaddr = E('span', hosts[mac].ipaddrs.flatMap((addr, i) => i ? [ E('br'), String(addr) ] : [ String(addr) ]));
 				}
 			});
 
@@ -531,7 +541,7 @@ return view.extend({
 					case 'tx':
 						return [ client.tx, '%1024.2mB'.format(client.tx) || '-' ];
 					default:
-						return client[key] || '-';
+						return L.dom.elem(client[key]) ? client[key] : textNode(client[key] || '-');
 				}
 			}
 
@@ -803,13 +813,13 @@ return view.extend({
 			table.append(
 				E('tr', { 'class': 'tr' }, [
 					E('td', { 'class': 'td' }, _("Name")),
-					E('td', { 'class': 'td' }, row['name'])
+					E('td', { 'class': 'td' }, textChildren(row['name']))
 				])
 			);
 			table.append(
 				E('tr', { 'class': 'tr' }, [
 					E('td', { 'class': 'td' }, _("Host Address")),
-					E('td', { 'class': 'td' }, row['ipaddr'])
+					E('td', { 'class': 'td' }, textChildren(row['ipaddr']))
 				])
 			);
 
@@ -821,8 +831,8 @@ return view.extend({
 					if (typeof host[key] !== 'undefined' || key == 'status')
 						table.append(
 							E('tr', { 'class': 'tr' }, [
-								E('td', { 'class': 'td' }, value),
-								E('td', { 'class': 'td' }, val)
+								E('td', { 'class': 'td' }, textChildren(value)),
+								E('td', { 'class': 'td' }, textChildren(val))
 							])
 						);
 				});
@@ -1411,7 +1421,7 @@ return view.extend({
 					]);
 				});
 			}).catch(err => {
-				ui.addNotification(null, E('p', err?.message || err), 'error');
+				ui.addNotification(null, E('p', textChildren(err?.message || err)), 'error');
 			});
 		};
 
