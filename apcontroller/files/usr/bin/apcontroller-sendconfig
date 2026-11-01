@@ -17,8 +17,23 @@ BASEPATH="/tmp/apcontroller"
 umask 077
 DBCLIENT_HOME="/etc/apcontroller"
 KNOWN_HOSTS="${DBCLIENT_HOME}/.ssh/known_hosts"
-mkdir -p "$BASEPATH"
-chmod 700 "$BASEPATH"
+# The state directory lives under /tmp. Refuse to use it when a link or a
+# directory of another account sits there: whoever owns the directory could
+# replace the status files that are read and acted on as root.
+ensure_basepath() {
+	if [ -L "$BASEPATH" ]; then
+		log_apcontroller "refusing $BASEPATH: it is a symbolic link"
+		exit 1
+	fi
+	mkdir -p "$BASEPATH" || exit 1
+	if [ ! -d "$BASEPATH" ] || [ "$(stat -c '%u' "$BASEPATH" 2>/dev/null)" != "0" ]; then
+		log_apcontroller "refusing $BASEPATH: not a directory owned by root"
+		exit 1
+	fi
+	chmod 700 "$BASEPATH"
+}
+
+ensure_basepath
 mkdir -p "$DBCLIENT_HOME/.ssh"
 chmod 700 "$DBCLIENT_HOME" "$DBCLIENT_HOME/.ssh"
 touch "$KNOWN_HOSTS"
